@@ -102,3 +102,30 @@ def test_create_and_mutate_limiters_are_independent() -> None:
     from app.core.rate_limit import rate_limit_listing_creation, rate_limit_listing_mutation
 
     assert rate_limit_listing_creation is not rate_limit_listing_mutation
+
+
+# ---- check_ip: the same limiter logic, for callers with no Starlette Request -------
+
+
+def test_check_ip_behaves_identically_to_check() -> None:
+    limiter = RateLimiter(max_requests=2, window_seconds=60, global_daily_cap=0)
+    limiter.check_ip("9.9.9.9")
+    limiter.check_ip("9.9.9.9")
+    with pytest.raises(HTTPException) as exc:
+        limiter.check_ip("9.9.9.9")
+    assert exc.value.status_code == 429
+
+
+def test_check_and_check_ip_share_the_same_counters() -> None:
+    limiter = RateLimiter(max_requests=2, window_seconds=60, global_daily_cap=0)
+    limiter.check(_fake_request("8.8.8.8"))
+    limiter.check_ip("8.8.8.8")  # same bucket as the request-based call above
+    with pytest.raises(HTTPException):
+        limiter.check_ip("8.8.8.8")
+
+
+def test_mcp_search_limiter_exists_and_is_independent() -> None:
+    from app.core.rate_limit import create_limiter, mcp_search_limiter, mutate_limiter
+
+    assert mcp_search_limiter is not create_limiter
+    assert mcp_search_limiter is not mutate_limiter

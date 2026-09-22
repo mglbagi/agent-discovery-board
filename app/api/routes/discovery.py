@@ -16,6 +16,8 @@ from app.core.constants import (
     TASK_CATEGORIES,
 )
 from app.core.models import ListingCreate, ListingResponse, ListingsPage
+from app.mcp_server import MCP_PATH
+from app.mcp_server import TOOL_NAME as MCP_TOOL_NAME
 
 router = APIRouter()
 
@@ -29,10 +31,11 @@ if not SERVICE_BASE_URL:
 
 LISTINGS_URL = f"{SERVICE_BASE_URL}/listings"
 
-# Service-specific URN, same pattern as the verification service's attestation and
-# MCP extensions: a pointer to this board's own schema, not a claim about an
+# Service-specific URNs, same pattern as the verification service's attestation and
+# MCP extensions: pointers to this board's own schema, not a claim about an
 # external standard.
 LISTINGS_EXTENSION_URI = "urn:agent-discovery-board:extension:listings:v1"
+MCP_EXTENSION_URI = "urn:agent-discovery-board:extension:mcp:v1"
 
 _EXAMPLE_LISTING_CREATE = {
     "name": "Example Extraction Agent",
@@ -98,6 +101,26 @@ def _build_listings_extension() -> dict[str, Any]:
     }
 
 
+def _build_mcp_extension() -> dict[str, Any]:
+    return {
+        "uri": MCP_EXTENSION_URI,
+        "description": (
+            "The same search/browse behavior as GET /listings is also available as a "
+            "Model Context Protocol (MCP) tool over Streamable HTTP, alongside the REST "
+            "endpoint - not replacing it. Free, no payment, no account. Submitting, "
+            "editing, or deactivating a listing is REST-only; there is no MCP tool for "
+            "those."
+        ),
+        "required": False,
+        "params": {
+            "transport": "streamable-http",
+            "url": f"{SERVICE_BASE_URL}{MCP_PATH}",
+            "toolName": MCP_TOOL_NAME,
+            "access": {"payment": "none", "rateLimited": True},
+        },
+    }
+
+
 def _build_agent_card() -> dict[str, Any]:
     from app.core import score_client
 
@@ -112,7 +135,7 @@ def _build_agent_card() -> dict[str, Any]:
         "version": "0.1.0",
         "defaultInputModes": ["application/json"],
         "defaultOutputModes": ["application/json"],
-        "capabilities": {"extensions": [extension]},
+        "capabilities": {"extensions": [extension, _build_mcp_extension()]},
         "skills": [
             {
                 "id": "submit-listing",

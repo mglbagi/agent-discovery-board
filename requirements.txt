@@ -9,5 +9,11 @@ httpx==0.28.1
 # x402 badge-lookup client. Same version as the verification service, for
 # no reason other than "known to work together."
 x402[evm]==2.23.0
+# MCP access path (app/mcp_server.py): a search_listings tool, alongside GET /listings.
+# Same versions as the sibling verification service's own MCP integration, pinned
+# together there for a resolver conflict between mcp>=1.29 and fastapi==0.115.6 - see
+# that project's requirements.txt for the full explanation.
+mcp==1.27.2
+sse-starlette==3.0.3
 pytest==8.3.4
 pytest-asyncio==0.25.2

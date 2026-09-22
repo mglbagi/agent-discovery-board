@@ -21,6 +21,7 @@ agent-discovery-board/
 │   │   ├── health.py              # GET /health (free)
 │   │   ├── listings.py            # POST/GET/PATCH/DELETE /listings (free)
 │   │   └── discovery.py           # /.well-known/agent-card(.json) (free)
+│   ├── mcp_server.py               # search_listings MCP tool, mounted at /mcp (free)
 │   └── core/
 │       ├── constants.py           # task_categories, known listing_types
 │       ├── models.py              # Pydantic request/response models + validation
@@ -32,7 +33,9 @@ agent-discovery-board/
 │       ├── limits.py              # Request body size cap
 │       └── request_logging.py     # Logs non-2xx/3xx responses
 ├── tests/
-├── scripts/worked_example.py      # End-to-end demo: one listing of each type, search/filter
+├── scripts/
+│   ├── worked_example.py          # End-to-end demo: one listing of each type, search/filter
+│   └── mcp_search_demo.py         # Calls the search_listings MCP tool like an agent would
 ├── requirements.txt
 ├── pytest.ini
 ├── render.yaml
@@ -116,6 +119,9 @@ A listing has:
 - **`DELETE /listings/{id}`** — **soft** delete: sets `status` to `inactive` rather than
   removing the row. Requires a wallet signature.
 
+Search/browse is also available as an MCP tool, alongside (not instead of) the REST
+endpoint above — see [MCP access path](#mcp-access-path).
+
 ## Wallet-signature authentication (no accounts, no passwords)
 
 Editing or deactivating a listing requires proving control of its `submitted_by`
@@ -195,15 +201,79 @@ domain, then 200 once a validly-signed payment header is attached — so the act
 payment-client code path is exercised end to end, with only the network endpoint
 faked.
 
+## MCP access path
+
+Search/browse is also available as an MCP (Model Context Protocol) tool,
+`search_listings`, over Streamable HTTP at `POST /mcp` — a second, additive way to
+reach exactly the same behavior as `GET /listings`, for MCP-compatible agent
+frameworks. It is not a replacement: the REST endpoint is unchanged, and submitting,
+editing, or deactivating a listing is REST-only (there's no MCP tool for those).
+
+**It shares the exact search logic, not a reimplementation of it.** Both `GET
+/listings` (`app/api/routes/listings.py`) and the MCP tool (`app/mcp_server.py`) call
+the same `search_listings` function — one place that queries, filters, and attaches
+trust badges, so the two access paths can never drift into returning different
+results for the same filters. This is verified directly in
+`tests/test_mcp_search.py`, which checks that REST and MCP return identical result
+sets for the same query.
+
+**Free, no payment, no account** — consistent with the rest of this service. Browsing
+a self-reported directory isn't a metered resource the way the verification service's
+checks are, so unlike that service's own paid MCP tool, there's no x402 gate here at
+all. Instead, since there's no payment to naturally throttle abuse, the tool is
+**rate-limited**: the same per-client-window + global-daily-cap pattern as every other
+limit on this service (`app/core/rate_limit.py`'s `mcp_search_limiter`, defaults 30
+calls/minute per client, 10,000/day globally — see `.env.example` to tune). A caller
+over either limit gets a tool error (`isError: true`) with `status: 429` and
+`retryable: true`, the same shape as any other tool error here, rather than a crash.
+
+**Parameters** (all optional): `listing_type`, `task_category` (a list — matches any
+of the given categories), `q` (free text over name/description), `status` (defaults
+to `active`), `limit` (1-100, default 20), `offset`. Same constraints as the REST
+query parameters, enforced in the shared `search_listings` function itself since the
+MCP surface has no equivalent of FastAPI's `Query(...)` validation.
+
+### Try it yourself
+
+With the server running (locally or deployed):
+
+```bash
+python scripts/mcp_search_demo.py --url http://127.0.0.1:8200/mcp
+python scripts/mcp_search_demo.py --url http://127.0.0.1:8200/mcp --q invoice
+python scripts/mcp_search_demo.py --url http://127.0.0.1:8200/mcp --listing-type offering --task-category "data validation"
+```
+
+That script does exactly what any MCP client does — connect, `list_tools()`, then
+`call_tool("search_listings", {...})` — and prints the result. From your own agent
+framework, calling it looks like (using the official `mcp` Python SDK; any
+MCP-compatible client works the same way):
+
+```python
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+async with streamablehttp_client("https://agent-discovery-board.onrender.com/mcp") as (read, write, _):
+    async with ClientSession(read, write) as session:
+        await session.initialize()
+        result = await session.call_tool(
+            "search_listings", {"task_category": ["data validation"], "q": "schema"}
+        )
+        print(result.content[0].text)  # JSON: {"listings": [...], "total": N, "limit": 20, "offset": 0}
+```
+
+No headers, no signature, no payment payload — just the tool call. Compare that to
+`PATCH`/`DELETE` (REST-only, wallet-signature required) or the verification service's
+own paid MCP tool, which needs an x402 payment attached after a small free trial.
+
 ## Discovery manifest
 
 `GET /.well-known/agent-card.json` (and `/.well-known/agent-card`, an alias without
 the extension) is a machine-readable, [A2A-protocol](https://a2a-protocol.org/)-style
-Agent Card for the board itself: what it is, its endpoints, the fixed task-category
-list, the documented starting `listing_type` values, the wallet-auth header format,
-whether trust-score badges are currently configured, and the full JSON Schema for
-listing create/response/list. `SERVICE_BASE_URL` controls the absolute URLs written
-into it — required, no silent localhost fallback (see `.env.example`).
+Agent Card for the board itself: what it is, its endpoints (REST and MCP), the fixed
+task-category list, the documented starting `listing_type` values, the wallet-auth
+header format, whether trust-score badges are currently configured, and the full JSON
+Schema for listing create/response/list. `SERVICE_BASE_URL` controls the absolute URLs
+written into it — required, no silent localhost fallback (see `.env.example`).
 
 ## Design decisions
 
@@ -270,7 +340,10 @@ business sharing a table.
   via a spoofed client address (same two-layer pattern, and the same known/accepted
   limitation — trusting `request.client.host` — as the verification service).
   `PATCH`/`DELETE` get a looser limit; the real gate there is the wallet signature,
-  this just stops wasted compute from garbage attempts.
+  this just stops wasted compute from garbage attempts. The MCP `search_listings`
+  tool has its own limiter, `mcp_search_limiter` (same per-client-window +
+  global-daily-cap shape), since it has no payment gate to throttle abuse either —
+  see [MCP access path](#mcp-access-path).
 - **Known, accepted limitations** — this is a v1 minimal board, not a hardened
   production directory at scale: no CAPTCHA or proof-of-work on listing creation (rate
   limiting + free-text moderation are out of scope by spec), free-text search is a

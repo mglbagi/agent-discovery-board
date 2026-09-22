@@ -43,7 +43,12 @@ class RateLimiter:
         self._served_today = 0
 
     def check(self, request: Request) -> None:
-        ip = _client_ip(request)
+        self.check_ip(_client_ip(request))
+
+    def check_ip(self, ip: str) -> None:
+        """Same check as `check`, for callers that don't have a Starlette `Request`
+        to read a client IP off of - e.g. the MCP tool in app/mcp_server.py, which
+        gets its caller's address from the MCP transport's own request context."""
         now = time.monotonic()
         utc = _utc_now()
         with self._lock:
@@ -96,6 +101,19 @@ mutate_limiter = RateLimiter(
     max_requests=int(os.getenv("LISTING_MUTATE_RATE_LIMIT_MAX_REQUESTS", "30")),
     window_seconds=float(os.getenv("LISTING_MUTATE_RATE_LIMIT_WINDOW_SECONDS", "60")),
     global_daily_cap=int(os.getenv("LISTING_MUTATE_GLOBAL_DAILY_CAP", "5000")),
+)
+
+# GET /listings has no equivalent limiter: it's a REST route, so FastAPI's own
+# Depends() wires rate_limit_listing_creation/_mutation in directly. The MCP
+# search_listings tool (app/mcp_server.py) isn't a route Depends() can attach to,
+# so it calls mcp_search_limiter.check_ip(...) itself. Looser than the write
+# limiters since browsing is free and meant to be used often - this exists only
+# because there's no payment gate here to naturally throttle abuse the way x402
+# does elsewhere.
+mcp_search_limiter = RateLimiter(
+    max_requests=int(os.getenv("MCP_SEARCH_RATE_LIMIT_MAX_REQUESTS", "30")),
+    window_seconds=float(os.getenv("MCP_SEARCH_RATE_LIMIT_WINDOW_SECONDS", "60")),
+    global_daily_cap=int(os.getenv("MCP_SEARCH_GLOBAL_DAILY_CAP", "10000")),
 )
 
 

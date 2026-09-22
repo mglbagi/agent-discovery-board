@@ -69,6 +69,53 @@ def _validate_task_category_filter(values: list[str] | None) -> list[str] | None
     return values
 
 
+MAX_SEARCH_LIMIT = 100
+MAX_SEARCH_Q_LENGTH = 200
+MAX_LISTING_TYPE_FILTER_LENGTH = 50
+
+
+async def search_listings(
+    *,
+    listing_type: str | None = None,
+    task_category: list[str] | None = None,
+    q: str | None = None,
+    status: str | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> ListingsPage:
+    """The single place that actually searches/filters listings and attaches trust
+    badges. Both `GET /listings` below and the `search_listings` MCP tool
+    (app/mcp_server.py) call this exact function - neither reimplements any of it.
+
+    FastAPI's `Query(...)` constraints on the REST route already reject most bad
+    input before it gets here, but the MCP tool has no equivalent of that, so the
+    same bounds are re-checked here too, once, for both callers.
+    """
+    if listing_type is not None and len(listing_type) > MAX_LISTING_TYPE_FILTER_LENGTH:
+        raise HTTPException(status_code=422, detail=f"listing_type must be at most {MAX_LISTING_TYPE_FILTER_LENGTH} characters")
+    if q is not None and len(q) > MAX_SEARCH_Q_LENGTH:
+        raise HTTPException(status_code=422, detail=f"q must be at most {MAX_SEARCH_Q_LENGTH} characters")
+    if status is not None and status not in ("active", "inactive"):
+        raise HTTPException(status_code=422, detail=f"status must be 'active' or 'inactive', got {status!r}")
+    if not (1 <= limit <= MAX_SEARCH_LIMIT):
+        raise HTTPException(status_code=422, detail=f"limit must be between 1 and {MAX_SEARCH_LIMIT}")
+    if offset < 0:
+        raise HTTPException(status_code=422, detail="offset must be >= 0")
+
+    categories = _validate_task_category_filter(task_category)
+    rows, total = await asyncio.to_thread(
+        db.list_listings,
+        listing_type=listing_type,
+        task_categories=categories,
+        q=q,
+        status=status,
+        limit=limit,
+        offset=offset,
+    )
+    listings = await asyncio.gather(*(_to_response(row) for row in rows))
+    return ListingsPage(listings=list(listings), total=total, limit=limit, offset=offset)
+
+
 @router.post("/listings", response_model=ListingResponse, status_code=201, dependencies=[Depends(rate_limit_listing_creation)])
 async def create_listing(payload: ListingCreate) -> ListingResponse:
     now = datetime.now(timezone.utc)
@@ -85,25 +132,16 @@ async def create_listing(payload: ListingCreate) -> ListingResponse:
 
 @router.get("/listings", response_model=ListingsPage)
 async def browse_listings(
-    listing_type: str | None = Query(default=None, max_length=50),
+    listing_type: str | None = Query(default=None, max_length=MAX_LISTING_TYPE_FILTER_LENGTH),
     task_category: list[str] | None = Query(default=None, alias="task_category"),
-    q: str | None = Query(default=None, max_length=200),
+    q: str | None = Query(default=None, max_length=MAX_SEARCH_Q_LENGTH),
     status: Status | None = Query(default=None),
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: int = Query(default=20, ge=1, le=MAX_SEARCH_LIMIT),
     offset: int = Query(default=0, ge=0),
 ) -> ListingsPage:
-    categories = _validate_task_category_filter(task_category)
-    rows, total = await asyncio.to_thread(
-        db.list_listings,
-        listing_type=listing_type,
-        task_categories=categories,
-        q=q,
-        status=status,
-        limit=limit,
-        offset=offset,
+    return await search_listings(
+        listing_type=listing_type, task_category=task_category, q=q, status=status, limit=limit, offset=offset
     )
-    listings = await asyncio.gather(*(_to_response(row) for row in rows))
-    return ListingsPage(listings=list(listings), total=total, limit=limit, offset=offset)
 
 
 @router.get("/listings/{listing_id}", response_model=ListingResponse)

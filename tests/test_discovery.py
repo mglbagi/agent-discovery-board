@@ -45,6 +45,14 @@ def test_agent_card_reflects_badge_configuration_state(monkeypatch) -> None:
     assert extension["params"]["trustScoreBadge"]["currentlyConfigured"] is True
 
 
+def test_agent_card_lists_the_mcp_search_tool() -> None:
+    card = client.get("/.well-known/agent-card.json").json()
+    mcp_ext = next(e for e in card["capabilities"]["extensions"] if "mcp" in e["uri"].lower())
+    assert mcp_ext["params"]["toolName"] == "search_listings"
+    assert mcp_ext["params"]["url"].endswith("/mcp")
+    assert mcp_ext["params"]["access"]["payment"] == "none"
+
+
 def test_health_check() -> None:
     response = client.get("/health")
     assert response.status_code == 200
