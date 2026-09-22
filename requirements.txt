@@ -1,0 +1,13 @@
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+psycopg[binary]==3.3.5
+psycopg-pool==3.3.2
+python-dotenv==1.2.3
+httpx==0.28.1
+# Pulls in eth_account + web3, used for wallet-signature auth (recovering a
+# signer from an EIP-191 signature) and for the (currently unconfigured)
+# x402 badge-lookup client. Same version as the verification service, for
+# no reason other than "known to work together."
+x402[evm]==2.23.0
+pytest==8.3.4
+pytest-asyncio==0.25.2

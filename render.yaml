@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: agent-discovery-board
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      # No values are set here on purpose (see README "Deployment") - these are
+      # required config guards (app/core/db.py, app/api/routes/discovery.py) and
+      # must never have a committed default.
+      - key: DATABASE_URL
+        sync: false
+      - key: SERVICE_BASE_URL
+        sync: false
+      # Optional; unset by default so trust-score badges ship disabled (see README
+      # "Trust score badges"). Set this in the Render dashboard, never here.
+      - key: BOARD_PAYER_PRIVATE_KEY
+        sync: false
