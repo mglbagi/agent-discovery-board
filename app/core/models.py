@@ -346,6 +346,14 @@ class ListingResponse(BaseModel):
     last_activity_at: datetime = Field(
         description="The latest of created_at, updated_at and last_seen_at; the default sort key of GET /listings."
     )
+    test: bool = Field(
+        default=False,
+        description="True for a temporary test listing (its name starts with 'test-'): hidden from default browse, "
+        "search and the search_listings tool (use include_test), and purged after expires_at.",
+    )
+    expires_at: datetime | None = Field(
+        default=None, description="When a test listing will be purged; null for real listings."
+    )
     stale: bool = Field(
         description="True when last_activity_at is older than the service's staleness threshold "
         "(STALE_AFTER_DAYS, default 60). Computed from stored data only; the board never probes endpoints."

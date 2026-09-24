@@ -13,6 +13,10 @@ Safe by construction:
   * audited: prints before/after and appends one JSON line per applied change to the
     log file (default ./admin_changes.log, which .gitignore already excludes).
   * with --apply you must retype the listing id to confirm (skip with --yes).
+  * --purge-test is the fallback for the board's automatic cleanup of temporary `test-`
+    listings (it purges lazily at startup and during requests, never on a timer, because
+    the free tier sleeps): dry run by default, only rows flagged is_test can ever match,
+    every deleted row is logged.
   * --delete is a HARD delete of one row: only for an INACTIVE listing (deactivate an
     active one with the signed DELETE first), only with the same expected-value guards,
     and the whole deleted row is written to the audit log so it can be reconstructed.
@@ -34,6 +38,9 @@ Examples:
   python scripts/admin_update_listing.py --id <uuid> --expect status=inactive \\
       --expect name="the exact name" --delete
 
+  # Purge expired test- listings (dry run; add --apply). --older-than-hours 0 = all of them:
+  python scripts/admin_update_listing.py --purge-test
+
   # Structured fields take JSON:
   python scripts/admin_update_listing.py --id <uuid> --expect status=active \\
       --set payment_options='[{"network":"eip155:8453","asset":"0x...","pay_to":"0x..."}]'
@@ -44,7 +51,7 @@ import getpass
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -58,6 +65,7 @@ from psycopg.types.json import Jsonb  # noqa: E402
 from pydantic import ValidationError  # noqa: E402
 
 import app  # noqa: E402,F401  (loads .env)
+from app.core import demo_data  # noqa: E402
 from app.core.endpoint import normalize_endpoint_url  # noqa: E402
 from app.core.models import ListingCreate  # noqa: E402
 from app.core.reserved import is_reserved_address  # noqa: E402
@@ -69,7 +77,7 @@ EDITABLE_FIELDS = (
 )
 NULLABLE_FIELDS = ("pricing_model", "pricing_amount", "erc8004_identity", "verification_agent_id")
 JSON_FIELDS = ("task_categories", "payment_options")
-COLUMNS = ", ".join(("id",) + EDITABLE_FIELDS + ("created_at", "updated_at", "last_seen_at"))
+COLUMNS = ", ".join(("id",) + EDITABLE_FIELDS + ("is_test", "created_at", "updated_at", "last_seen_at"))
 
 EXIT_OK, EXIT_USAGE, EXIT_GUARD = 0, 1, 2
 
@@ -184,9 +192,58 @@ def _run_delete(args: argparse.Namespace, url: str, expected: dict[str, Any]) ->
     return EXIT_OK
 
 
+def _run_purge(args: argparse.Namespace, url: str) -> int:
+    hours = demo_data.TEST_LISTING_TTL_HOURS if args.older_than_hours is None else args.older_than_hours
+    if hours < 0:
+        raise AdminError("--older-than-hours must be >= 0.")
+    if not 1 <= args.limit <= 10_000:
+        raise AdminError("--limit must be between 1 and 10000.")
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    print(f"Target database: {_target(url)}")
+    print(f"Mode: PURGE TEST LISTINGS {'(APPLY)' if args.apply else '(DRY RUN, nothing will be written)'}")
+    print(f"Selecting listings flagged is_test that were created more than {hours:g}h ago (before {cutoff.isoformat()})")
+
+    with psycopg.connect(url, row_factory=dict_row) as conn:
+        rows = conn.execute(
+            f"SELECT {COLUMNS} FROM listings WHERE is_test AND created_at < %(cutoff)s ORDER BY created_at LIMIT %(limit)s",
+            {"cutoff": cutoff, "limit": args.limit},
+        ).fetchall()
+        print(f"\n{len(rows)} test listing(s) selected:")
+        for row in rows:
+            print(f"  {row['id']}  {row['status']:8}  created {row['created_at']:%Y-%m-%d %H:%M}  {row['name']}")
+        if not rows:
+            print("Nothing to purge.")
+            return EXIT_OK
+        if not args.apply:
+            print("\nDRY RUN: nothing deleted. Re-run with --apply to delete them.")
+            return EXIT_OK
+        if not args.yes and input("\nType PURGE to delete them: ").strip() != "PURGE":
+            raise AdminError("confirmation did not match; nothing written.", EXIT_GUARD)
+        with conn.transaction():
+            deleted = conn.execute(
+                "DELETE FROM listings WHERE id = ANY(%(ids)s) AND is_test AND created_at < %(cutoff)s RETURNING id",
+                {"ids": [r["id"] for r in rows], "cutoff": cutoff},
+            ).fetchall()
+
+    print(f"\nDeleted {len(deleted)} test listing(s).")
+    gone = {r["id"] for r in deleted}
+    _append_log(
+        args,
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "operator": getpass.getuser(),
+            "db": _target(url),
+            "action": "purge-test",
+            "older_than_hours": hours,
+            "deleted_rows": [r for r in rows if r["id"] in gone],
+        },
+    )
+    return EXIT_OK
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--id", required=True, help="the listing's id")
+    ap.add_argument("--id", help="the listing's id (required unless --purge-test)")
     ap.add_argument("--expect", action="append", default=[], metavar="FIELD=VALUE",
                     help="current value the listing must have (repeatable; at least one required)")
     ap.add_argument("--set", dest="sets", action="append", default=[], metavar="FIELD=VALUE",
@@ -195,10 +252,17 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"set a nullable field to NULL ({', '.join(NULLABLE_FIELDS)})")
     ap.add_argument("--delete", action="store_true",
                     help="HARD-delete the listing (inactive listings only); cannot be combined with --set/--unset")
+    ap.add_argument("--purge-test", action="store_true",
+                    help="delete expired temporary test- listings (only is_test rows can match); no --id needed")
+    ap.add_argument("--older-than-hours", type=float, default=None, metavar="H",
+                    help="with --purge-test: age threshold in hours (default: the board's TTL; 0 = every test listing)")
+    ap.add_argument("--limit", type=int, default=1000, help="with --purge-test: maximum rows per run (default 1000)")
     ap.add_argument("--apply", action="store_true", help="write the change (default is a dry run)")
     ap.add_argument("--yes", action="store_true", help="with --apply, skip the retype-the-id confirmation")
     ap.add_argument("--log-file", default="admin_changes.log", help="audit log, one JSON line per applied change")
     args = ap.parse_args(argv)
+    if not args.purge_test and not args.id:
+        ap.error("--id is required unless --purge-test is given")
 
     try:
         return _run(args)
@@ -211,6 +275,10 @@ def _run(args: argparse.Namespace) -> int:
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise AdminError("DATABASE_URL is not set.")
+    if args.purge_test:
+        if args.id or args.expect or args.sets or args.unset or args.delete:
+            raise AdminError("--purge-test stands alone: do not combine it with --id/--expect/--set/--unset/--delete.")
+        return _run_purge(args, url)
     expected = _parse_pairs(args.expect, "--expect")
     if not expected:
         raise AdminError("at least one --expect FIELD=VALUE is required (state what you believe is there now).")
@@ -246,6 +314,11 @@ def _run(args: argparse.Namespace) -> int:
             raise AdminError(f"the resulting listing is invalid:\n{exc}") from exc
         if candidate["status"] not in ("active", "inactive"):
             raise AdminError("status must be 'active' or 'inactive'.")
+        if demo_data.is_test_name(candidate["name"]) != before["is_test"]:
+            raise AdminError(
+                "invalid_test_name: the 'test-' name prefix decides whether a listing is temporary test data; "
+                "it cannot be added to or removed from an existing listing's name."
+            )
         if is_reserved_address(candidate["submitted_by"]):
             raise AdminError("reserved_address: that submitted_by has a publicly known private key; refusing.")
 

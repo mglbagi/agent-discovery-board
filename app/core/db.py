@@ -104,6 +104,9 @@ def _ensure_schema() -> None:
             conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
             conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS payment_options JSONB NOT NULL DEFAULT '[]'::jsonb")
             conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS endpoint_key TEXT")
+            # Decided once at creation from the `test-` name prefix (app/core/demo_data.py); existing
+            # rows are real (FALSE), whatever they are named.
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS is_test BOOLEAN NOT NULL DEFAULT FALSE")
             for row in conn.execute("SELECT id, endpoint_url FROM listings WHERE endpoint_key IS NULL").fetchall():
                 conn.execute(
                     "UPDATE listings SET endpoint_key = %s WHERE id = %s",
@@ -125,11 +128,17 @@ def _ensure_schema() -> None:
             # (offering) per (normalized endpoint, submitter). Announcements, notices and
             # requests are exempt. Not CONCURRENTLY, so a pre-existing duplicate makes
             # this fail cleanly instead of leaving an invalid index behind.
-            conn.execute("DROP INDEX IF EXISTS listings_active_endpoint_owner_uniq")  # earlier, all-types version
+            # The guard is scoped by is_test: test listings only collide with other test
+            # listings, never with real ones (so a demo can show a 409 without touching real data).
+            for old_index in ("listings_active_endpoint_owner_uniq", "listings_active_offering_endpoint_owner_uniq"):
+                conn.execute(f"DROP INDEX IF EXISTS {old_index}")  # earlier versions of this guard
             conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS listings_active_offering_endpoint_owner_uniq "
-                "ON listings (endpoint_key, lower(submitted_by)) "
+                "CREATE UNIQUE INDEX IF NOT EXISTS listings_active_offering_scope_endpoint_owner_uniq "
+                "ON listings (is_test, endpoint_key, lower(submitted_by)) "
                 f"WHERE status = 'active' AND listing_type = '{DUPLICATE_GUARDED_LISTING_TYPE}'"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS listings_test_created_idx ON listings (created_at) WHERE is_test"
             )
         _schema_ready = True
 
@@ -158,7 +167,7 @@ def _connection() -> Iterator[psycopg.Connection]:
 _COLUMNS = (
     "id", "name", "description", "listing_type", "task_categories", "endpoint_url",
     "payment_wallet", "pricing_model", "pricing_amount", "payment_options", "erc8004_identity",
-    "verification_agent_id", "submitted_by", "status", "created_at", "updated_at", "last_seen_at",
+    "verification_agent_id", "submitted_by", "status", "is_test", "created_at", "updated_at", "last_seen_at",
 )
 _READ = ", ".join(_COLUMNS)
 _WRITE_COLUMNS = _COLUMNS[:-1] + ("endpoint_key",)  # last_seen_at is only ever set by heartbeat
@@ -186,14 +195,23 @@ def get_listing(listing_id: str) -> dict[str, Any] | None:
         return conn.execute(f"SELECT {_READ} FROM listings WHERE id = %s", (listing_id,)).fetchone()
 
 
-def find_active_duplicate(endpoint_url: str, submitted_by: str, exclude_id: str | None = None) -> str | None:
+def find_active_duplicate(
+    endpoint_url: str, submitted_by: str, exclude_id: str | None = None, is_test: bool = False
+) -> str | None:
     """id of the ACTIVE offering (the only guarded type) with the same normalized endpoint
-    and submitter, if any."""
+    and submitter, if any. Test listings and real listings are separate scopes."""
     with _connection() as conn:
         row = conn.execute(
             "SELECT id FROM listings WHERE endpoint_key = %s AND lower(submitted_by) = lower(%s) "
-            "AND status = 'active' AND listing_type = %s AND (%s::text IS NULL OR id <> %s) LIMIT 1",
-            (normalize_endpoint_url(endpoint_url), submitted_by, DUPLICATE_GUARDED_LISTING_TYPE, exclude_id, exclude_id),
+            "AND status = 'active' AND listing_type = %s AND is_test = %s AND (%s::text IS NULL OR id <> %s) LIMIT 1",
+            (
+                normalize_endpoint_url(endpoint_url),
+                submitted_by,
+                DUPLICATE_GUARDED_LISTING_TYPE,
+                is_test,
+                exclude_id,
+                exclude_id,
+            ),
         ).fetchone()
     return row["id"] if row else None
 
@@ -241,6 +259,7 @@ def list_listings(
     limit: int,
     offset: int,
     cursor: tuple[datetime, str] | None = None,
+    include_test: bool = False,
 ) -> tuple[list[dict[str, Any]], int, bool]:
     """Returns (page of rows, total matching the filters, whether more rows follow).
     Order is newest last activity first, id as the tiebreaker - a total order, so a
@@ -250,6 +269,8 @@ def list_listings(
 
     conditions.append("status = %(status)s")
     params["status"] = status if status is not None else "active"
+    if not include_test:
+        conditions.append("NOT is_test")
 
     if listing_type is not None:
         conditions.append("listing_type = %(listing_type)s")
@@ -283,3 +304,17 @@ def list_listings(
             {**page_params, "limit": limit + 1, "offset": offset},
         ).fetchall()
     return rows[:limit], total, len(rows) > limit
+
+
+def purge_expired_test_listings(cutoff: datetime, limit: int) -> list[str]:
+    """Delete up to `limit` test listings created before `cutoff` (oldest first); returns
+    their ids. One indexed statement (listings_test_created_idx); only is_test rows can
+    ever match, so a real listing cannot be removed by this."""
+    with _connection() as conn:
+        rows = conn.execute(
+            "DELETE FROM listings WHERE id IN ("
+            "SELECT id FROM listings WHERE is_test AND created_at < %(cutoff)s ORDER BY created_at LIMIT %(limit)s"
+            ") RETURNING id",
+            {"cutoff": cutoff, "limit": limit},
+        ).fetchall()
+    return [r["id"] for r in rows]

@@ -243,3 +243,69 @@ async def test_a_bad_cursor_via_mcp_is_a_coded_error(live_server) -> None:
     body = _body(result)
     assert_error_body(body, "invalid_cursor")
     assert body["next_actions"][0]["description"].startswith("Call again without a cursor")
+
+
+async def test_test_listings_are_hidden_from_the_tool_unless_include_test(live_server) -> None:
+    marker = "mcp-tl-" + Account.create().address[-8:]
+    test_listing = await _create_via_rest(live_server, name=f"test-{marker}")
+    real = await _create_via_rest(live_server, name=f"real {marker}")
+
+    default = _body(await _call_tool(live_server, "search_listings", {"q": marker}))
+    assert [i["id"] for i in default["listings"]] == [real["id"]]
+
+    shown = _body(await _call_tool(live_server, "search_listings", {"q": marker, "include_test": True}))
+    assert {i["id"] for i in shown["listings"]} == {real["id"], test_listing["id"]}
+    flagged = {i["id"]: i for i in shown["listings"]}
+    assert flagged[test_listing["id"]]["test"] is True and flagged[test_listing["id"]]["expires_at"]
+    assert flagged[real["id"]]["test"] is False and flagged[real["id"]]["expires_at"] is None
+
+
+async def test_the_tool_description_mentions_test_listings(live_server) -> None:
+    async with streamablehttp_client(f"{live_server}/mcp/") as (read, write, _), ClientSession(read, write) as session:
+        await session.initialize()
+        tool = (await session.list_tools()).tools[0]
+        assert "include_test" in json.dumps(tool.inputSchema) and "test-" in tool.description
+
+
+async def test_agent_view_runs_end_to_end_and_leaves_nothing_behind(live_server, capsys) -> None:
+    """The raw-JSON walkthrough against a real HTTP server, MCP calls included. It runs in
+    a worker thread (it makes blocking HTTP calls and its own event loop) while the server
+    keeps running on this one."""
+    import importlib.util
+    from pathlib import Path
+    from urllib.parse import urlparse
+
+    from tests.helpers import db_row
+
+    scripts = Path(__file__).resolve().parent.parent / "scripts"
+    import sys
+
+    sys.path.insert(0, str(scripts))
+    spec = importlib.util.spec_from_file_location("agent_view", scripts / "agent_view.py")
+    agent_view = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(agent_view)
+    import demo_safety
+
+    created: list[str] = []
+    real_create = demo_safety.DemoSession.create
+
+    def recording_create(self, payload, account):
+        response = real_create(self, payload, account)
+        if response.status_code == 201:
+            created.append(response.json()["id"])
+        return response
+
+    demo_safety.DemoSession.create = recording_create
+    try:
+        code = await asyncio.to_thread(agent_view.main, ["--url", live_server])
+    finally:
+        demo_safety.DemoSession.create = real_create
+
+    out = capsys.readouterr().out
+    assert code == 0 and "### 14. MCP search_listings" in out and "cleanup: deactivated" in out
+    assert "test- listings are hidden by default" in out and "total 0" in out
+    assert len(created) == 2
+    for listing_id in created:
+        row = db_row(listing_id)
+        assert row["is_test"] and row["status"] == "inactive"
+        assert urlparse(row["endpoint_url"]).hostname.endswith(".example.invalid")

@@ -17,6 +17,7 @@ from app.core.constants import (
     SERVICE_VERSION,
     TASK_CATEGORIES,
 )
+from app.core import demo_data
 from app.core.activity import HEARTBEAT_MIN_INTERVAL, STALE_AFTER_DAYS
 from app.core.errors import SIGNATURE_HEADER_FIELD, error_codes_manifest
 from app.core.reserved import RESERVED_ADDRESSES
@@ -98,6 +99,7 @@ def _build_listings_extension() -> dict[str, Any]:
                         "limit",
                         "cursor (preferred)",
                         "offset (legacy)",
+                        "include_test",
                     ],
                 },
                 "get": {"method": "GET", "url": f"{LISTINGS_URL}/{{id}}", "auth": "none"},
@@ -141,6 +143,25 @@ def _build_listings_extension() -> dict[str, Any]:
                 "amount is a decimal string in whole-token units; unit is a slug such as per_call. Not "
                 "applicable to announcement/notice listings.",
                 "example": _EXAMPLE_LISTING_CREATE["payment_options"][0],
+            },
+            "testListings": {
+                "description": "Temporary demo data. A listing whose name starts with exactly "
+                f"'{demo_data.TEST_NAME_PREFIX}' is a test listing: hidden from default browse, search and the "
+                "search_listings tool (pass include_test=true to see them), purged "
+                f"{demo_data.TEST_LISTING_TTL_HOURS:g} hours after creation, and never real. Use it for "
+                "smoke tests and demos, including against production.",
+                "prefix": demo_data.TEST_NAME_PREFIX,
+                "ttlHours": demo_data.TEST_LISTING_TTL_HOURS,
+                "worksByIdLikeAnyListing": "GET, PATCH, heartbeat and DELETE behave normally",
+                "duplicateDetection": "test listings only collide with other test listings (so a demo can show "
+                "409 duplicate_listing); they never block or trigger it for real listings",
+                "badges": "no trust-score lookup is ever made for a test listing",
+                "purge": "there is no background timer (the service sleeps when idle): expired test listings are "
+                "removed at startup and, throttled and bounded, during ordinary requests",
+                "immutable": "the prefix is decided at creation; adding or removing it later is 422 "
+                "invalid_test_name, so a real listing can never become purgeable",
+                "responseFields": ["test", "expires_at"],
+                "suggestedEndpointUrls": "https://test-<id>.example.invalid/... (the .invalid TLD can never resolve)",
             },
             "reservedAddresses": {
                 "description": "These addresses are refused as submitted_by (422 reserved_address) because their "

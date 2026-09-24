@@ -56,6 +56,12 @@ ERROR_CODES: dict[str, ErrorSpec] = {
         "(only offerings are guarded; announcements, notices and requests may repeat). "
         "existing_listing_id names it; nothing was created or modified.",
     ),
+    "invalid_test_name": ErrorSpec(
+        422,
+        False,
+        "The 'test-' name prefix marks a listing as temporary test data. It can only be set when a listing is "
+        "created; it cannot be added to or removed from an existing listing's name.",
+    ),
     "reserved_address": ErrorSpec(
         422,
         False,
@@ -189,6 +195,17 @@ def next_actions_for(code: str, *, method: str, path: str, extras: dict[str, Any
                 "Change the existing listing instead (signed by its submitted_by).",
             ),
             action("GET", f"/listings/{existing}", [], "Inspect the existing listing."),
+        ]
+    if code == "invalid_test_name":
+        return [
+            action(
+                method,
+                path,
+                [SIGNATURE_HEADER_FIELD, "name"],
+                "Resend with a name that keeps the listing's current test-/real status: only listings created "
+                "with a 'test-' name are test listings, and that cannot be changed later.",
+            ),
+            _manifest_action(),
         ]
     if code == "reserved_address":
         return [

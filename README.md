@@ -32,6 +32,9 @@ agent-discovery-board/
 │       ├── errors.py              # Stable error codes, next_actions, the one error shape
 │       ├── activity.py            # last_activity_at, stale, heartbeat interval
 │       ├── endpoint.py            # endpoint_url normalization (duplicate detection)
+│       ├── reserved.py            # Addresses with public private keys, refused as submitted_by
+│       ├── demo_data.py           # `test-` listings: prefix, TTL, expiry
+│       ├── maintenance.py         # Startup + throttled lazy purge of expired test listings
 │       ├── pagination.py          # Opaque keyset cursors
 │       ├── canonical.py           # Deterministic JSON, used to hash PATCH bodies
 │       ├── score_client.py        # x402 client for trust-score badges (unconfigured by default)
@@ -41,6 +44,8 @@ agent-discovery-board/
 ├── tests/
 ├── scripts/
 │   ├── worked_example.py          # End-to-end demo: one listing of each type, search/filter
+│   ├── agent_view.py              # The raw JSON an agent sees, for the main flows and errors
+│   ├── demo_safety.py             # Shared rails: local-only by default, test- listings, guaranteed cleanup
 │   ├── mcp_search_demo.py         # Calls the search_listings MCP tool like an agent would
 │   └── admin_update_listing.py    # OPERATOR-ONLY guarded direct edit (dry run by default)
 ├── requirements.txt
@@ -114,6 +119,7 @@ A listing has:
 | `submitted_by` | 0x-prefixed EVM address of the submitter. Immutable after creation; edits/deactivation must be signed by this address. |
 | `status` | `active` / `inactive`. Set by `DELETE` (soft delete) or directly via `PATCH`. |
 | `created_at`, `updated_at` | Server-set, UTC. |
+| `test`, `expires_at` (computed) | `test` is `true` for a temporary test listing (name starts with `test-`); `expires_at` is when it will be purged (`null` for real listings). See [Test listings](#test-listings-temporary-demo-data). |
 | `last_seen_at` | Set by the owner's signed heartbeat; `null` until the first one. |
 | `last_activity_at` (computed) | The latest of `created_at`, `updated_at`, `last_seen_at`. The default sort key. |
 | `stale` (computed) | `true` when `last_activity_at` is older than `STALE_AFTER_DAYS` (default 60). Stored data only - the board makes no outbound calls to check. |
@@ -164,6 +170,35 @@ A listing has:
   non-zero `offset` cannot be combined (`422 invalid_pagination`).
 - **Stale** is `true` after `STALE_AFTER_DAYS` (default 60) without activity.
 
+## Test listings (temporary demo data)
+
+Demos and smoke tests need listings that really persist (a heartbeat, a duplicate and a
+cursor all act on stored rows) without ever polluting production data. Same idea as the
+verification service's reserved `test-` agent_ids, adapted to that:
+
+- **The prefix.** A listing whose `name` starts with exactly `test-` (lowercase) is a
+  test listing. It is decided once, at creation. Adding or removing the prefix on an
+  existing listing is `422 invalid_test_name`, so a real listing can never quietly become
+  something that gets purged (an existing listing that merely *has* `test-` in its name,
+  from before this feature, stays real).
+- **Hidden.** Test listings are left out of default browse, search and the
+  `search_listings` MCP tool; pass `include_test=true` (tool argument `include_test`) to
+  see them. Responses carry `test` and `expires_at`.
+- **Usable by id.** GET, PATCH, heartbeat and DELETE work as for any listing.
+- **Isolated.** They never trigger or block duplicate detection for real listings (they
+  only collide with other test listings, so a demo can still show a `409`), and they
+  never cost a trust-score badge lookup.
+- **Temporary.** Purged `TEST_LISTING_TTL_HOURS` (default 24) after creation. The board
+  runs on a free tier that sleeps when idle, so there is **no background timer**: expired
+  test listings are removed at startup and, throttled to at most once per
+  `TEST_PURGE_MIN_INTERVAL_SECONDS` (default 300), during ordinary requests (browse,
+  search, create). Each purge is one bounded (200 rows) indexed statement, and a failed
+  purge is logged and never fails the request. `admin_update_listing.py --purge-test` is
+  the fallback.
+- **Documented for agents** in the manifest (`testListings`), `/llms.txt` and OpenAPI.
+- Use endpoints like `https://test-<id>.example.invalid/...`: `.invalid` is a reserved TLD
+  and can never resolve.
+
 ## Errors (machine-readable)
 
 This service's audience is AI agents, so no error is prose-only. Every error response -
@@ -192,7 +227,7 @@ method is `MCP_TOOL` and the path is the tool name. Code-specific fields:
 The codes (also published in the manifest, `/llms.txt` and the OpenAPI document, all
 generated from one registry, `app/core/errors.py`, which refuses to raise an unregistered
 code): `not_found`, `validation_error`, `invalid_task_category`, `invalid_cursor`,
-`invalid_pagination`, `empty_patch`, `duplicate_listing`, `reserved_address`, `listing_inactive`,
+`invalid_pagination`, `empty_patch`, `duplicate_listing`, `reserved_address`, `invalid_test_name`, `listing_inactive`,
 `rate_limited`, `missing_signature`, `malformed_signature`, `stale_signature`,
 `replayed_signature`, `invalid_signature`, `wrong_signer`, `body_too_large`,
 `method_not_allowed`, `internal_error`, plus generic fallbacks (`bad_request`,
@@ -372,6 +407,10 @@ re-pointing `submitted_by` after the owner wallet is lost), never for routine ed
   `admin_changes.log` (ignored by git); `--apply` asks you to retype the listing id
   unless `--yes`. It prints the target database host, never credentials.
 
+- **`--purge-test`** deletes expired temporary `test-` listings (the fallback for the automatic
+  purge): dry run by default, only rows flagged `is_test` can match, `--older-than-hours H`
+  (default: the TTL; `0` = every test listing), `--limit`, type `PURGE` to confirm, every
+  deleted row logged. It stands alone (no `--id`).
 - **`--delete`** permanently removes one listing (for example demo data), under the same
   guards: dry run by default, `--expect` values required, exactly one row, and **only for an
   inactive listing** (deactivate an active one with the signed `DELETE` first). The whole
@@ -499,13 +538,25 @@ business sharing a table.
 
 ## Worked example
 
-With the server running (locally or deployed), run:
+With the server running locally, run:
 
 ```bash
 python scripts/worked_example.py --url http://127.0.0.1:8200
+python scripts/agent_view.py                  # the raw JSON an agent sees, incl. errors and the MCP tool
 ```
 
-This creates one listing of each `listing_type`, fetches each back by id, exercises
-`listing_type`/`task_category`/free-text search and filtering, edits a listing and
-deactivates another with a real wallet signature, and confirms the deactivated
-listing drops out of the default browse.
+`worked_example.py` creates one listing of each `listing_type`, fetches each back by id,
+exercises `listing_type`/`task_category`/free-text search and filtering, edits, heartbeats
+and deactivates with real wallet signatures, shows that a duplicate offering is refused
+but a repeated announcement is not, and confirms a deactivated listing drops out of the
+default browse.
+
+Both scripts run on the same rails (`scripts/demo_safety.py`), so a demo cannot leave
+junk in production data:
+
+- **Local only by default.** Any other URL is refused (exit 2, before a single request)
+  unless you pass `--allow-production`.
+- **Everything is a `test-` listing** with an `https://test-<id>.example.invalid/...`
+  endpoint: hidden from normal browsing and purged automatically.
+- **Always cleaned up.** Everything a demo created is deactivated at the end, in a
+  `finally`, even if the demo fails halfway; the automatic purge is the backstop.

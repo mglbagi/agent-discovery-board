@@ -7,6 +7,7 @@ from fastapi import APIRouter
 from fastapi.responses import PlainTextResponse
 
 from app.api.routes.discovery import SERVICE_BASE_URL
+from app.core import demo_data
 from app.core.activity import HEARTBEAT_MIN_INTERVAL, STALE_AFTER_DAYS
 from app.core.constants import KNOWN_LISTING_TYPES, SERVICE_DESCRIPTION, TASK_CATEGORIES
 from app.core.errors import ERROR_CODES
@@ -32,6 +33,8 @@ Newest last activity first; pass next_cursor back as cursor for the next page.
 - GET {SERVICE_BASE_URL}/listings/{{id}} - one listing.
 - MCP: POST {SERVICE_BASE_URL}/mcp, tool search_listings (same search, same results).
 - Each listing has last_activity_at and stale (true after {STALE_AFTER_DAYS:g} days without activity).
+- Listings whose name starts with "{demo_data.TEST_NAME_PREFIX}" are TEMPORARY test listings: hidden from browse, search and the search_listings tool unless include_test=true, and deleted \
+{demo_data.TEST_LISTING_TTL_HOURS:g}h after creation. They work by id like any listing; use them for demos and smoke tests (endpoint e.g. https://test-abc123.example.invalid/x). The prefix cannot be added to or removed from an existing listing (invalid_test_name).
 
 ## Write
 

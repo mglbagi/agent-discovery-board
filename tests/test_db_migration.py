@@ -36,15 +36,16 @@ OWNER = "0x42a3c399f83BCcC3b9eEf81e65954a715D54855E"
 
 
 def _insert_legacy(
-    conn, endpoint_url: str, *, status: str = "active", submitted_by: str = OWNER, listing_type: str = "offering"
+    conn, endpoint_url: str, *, status: str = "active", submitted_by: str = OWNER, listing_type: str = "offering",
+    name: str = "Legacy",
 ) -> str:
     listing_id = str(uuid.uuid4())
     now = datetime(2026, 9, 1, tzinfo=timezone.utc)
     conn.execute(
         "INSERT INTO listings (id, name, description, listing_type, task_categories, endpoint_url, payment_wallet, "
         "pricing_model, pricing_amount, submitted_by, status, created_at, updated_at) "
-        "VALUES (%s, 'Legacy', 'made by the previous version', %s, %s, %s, %s, 'per_call', '$0.02', %s, %s, %s, %s)",
-        (listing_id, listing_type, ["data validation"], endpoint_url, OWNER, submitted_by, status, now, now),
+        "VALUES (%s, %s, 'made by the previous version', %s, %s, %s, %s, 'per_call', '$0.02', %s, %s, %s, %s)",
+        (listing_id, name, listing_type, ["data validation"], endpoint_url, OWNER, submitted_by, status, now, now),
     )
     return listing_id
 
@@ -74,7 +75,7 @@ def test_a_legacy_table_is_upgraded_in_place_and_rows_are_backfilled(legacy_tabl
     ).fetchone()
     assert row == ("https://example.com/verify/schema", [], None)
     indexes = {r[0] for r in legacy_table.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'listings'").fetchall()}
-    assert {"listings_active_offering_endpoint_owner_uniq", "listings_activity_idx"} <= indexes
+    assert {"listings_active_offering_scope_endpoint_owner_uniq", "listings_activity_idx"} <= indexes
 
 
 def test_the_migrated_row_is_served_normally_and_the_duplicate_guard_covers_it(legacy_table) -> None:
@@ -139,4 +140,28 @@ def test_the_earlier_all_types_index_is_replaced(legacy_table) -> None:
     db.init_db()
     indexes = {r[0] for r in legacy_table.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'listings'").fetchall()}
     assert "listings_active_endpoint_owner_uniq" not in indexes
-    assert "listings_active_offering_endpoint_owner_uniq" in indexes
+    assert "listings_active_offering_scope_endpoint_owner_uniq" in indexes
+
+
+def test_existing_rows_migrate_as_real_even_when_named_test(legacy_table) -> None:
+    listing_id = _insert_legacy(legacy_table, "https://named-test.example.com/agent", name="test-runner service")
+    legacy_table.execute("UPDATE listings SET created_at = '2020-01-01T00:00:00Z' WHERE id = %s", (listing_id,))
+    db.init_db()
+
+    assert legacy_table.execute("SELECT is_test FROM listings WHERE id = %s", (listing_id,)).fetchone() == (False,)
+    from datetime import datetime, timezone
+
+    assert db.purge_expired_test_listings(datetime.now(timezone.utc), 100) == []  # never purged
+    assert db.get_listing(listing_id)["name"] == "test-runner service"
+
+
+def test_the_previous_versions_duplicate_index_is_replaced_by_the_scoped_one(legacy_table) -> None:
+    legacy_table.execute("ALTER TABLE listings ADD COLUMN endpoint_key TEXT")
+    legacy_table.execute(
+        "CREATE UNIQUE INDEX listings_active_offering_endpoint_owner_uniq ON listings (endpoint_key, lower(submitted_by)) "
+        "WHERE status = 'active' AND listing_type = 'offering'"
+    )
+    db.init_db()
+    indexes = {r[0] for r in legacy_table.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'listings'").fetchall()}
+    assert "listings_active_offering_endpoint_owner_uniq" not in indexes
+    assert {"listings_active_offering_scope_endpoint_owner_uniq", "listings_test_created_idx"} <= indexes

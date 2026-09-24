@@ -22,7 +22,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Path, Query, Request
 
-from app.core import db, score_client
+from app.core import db, demo_data, maintenance, score_client
 from app.core.activity import HEARTBEAT_MIN_INTERVAL, is_stale, last_activity_at
 from app.core.constants import DUPLICATE_GUARDED_LISTING_TYPE, TASK_CATEGORIES
 from app.core.errors import ApiError
@@ -55,7 +55,8 @@ _ERROR_DESCRIPTIONS = {
     404: "No such listing (error_code: not_found).",
     409: "duplicate_listing (an active offering with the same normalized endpoint_url and submitted_by exists; "
     "see existing_listing_id) or listing_inactive.",
-    422: "Validation failed (error_code: validation_error, reserved_address or a more specific code).",
+    422: "Validation failed (error_code: validation_error, reserved_address, invalid_test_name or a more "
+    "specific code).",
     429: "rate_limited; see retry_after.",
 }
 
@@ -76,10 +77,15 @@ async def _raw_body_dict(request: Request) -> dict[str, Any]:
 
 
 async def _to_response(row: dict[str, Any]) -> ListingResponse:
-    agent_id = row.get("verification_agent_id") or row["submitted_by"]
-    raw_badge = await score_client.get_badge(agent_id)
+    # Test listings never cost a trust-score lookup.
+    if row["is_test"]:
+        raw_badge = None
+    else:
+        raw_badge = await score_client.get_badge(row.get("verification_agent_id") or row["submitted_by"])
     return ListingResponse(
         **row,
+        test=row["is_test"],
+        expires_at=demo_data.expires_at(row["created_at"]) if row["is_test"] else None,
         last_activity_at=last_activity_at(row),
         stale=is_stale(row),
         badge=Badge(**raw_badge) if raw_badge is not None else None,
@@ -114,6 +120,7 @@ async def search_listings(
     limit: int = 20,
     offset: int = 0,
     cursor: str | None = None,
+    include_test: bool = False,
 ) -> ListingsPage:
     """The single place that actually searches/filters listings and attaches trust
     badges. Both `GET /listings` below and the `search_listings` MCP tool
@@ -126,7 +133,11 @@ async def search_listings(
     FastAPI's `Query(...)` constraints on the REST route already reject most bad
     input before it gets here, but the MCP tool has no equivalent of that, so the
     same bounds are re-checked here too, once, for both callers.
+
+    Temporary `test-` listings are excluded unless include_test is set. This is also one of
+    the cheap places that opportunistically purges expired test listings (throttled).
     """
+    await asyncio.to_thread(maintenance.maybe_purge)
     if listing_type is not None and len(listing_type) > MAX_LISTING_TYPE_FILTER_LENGTH:
         raise ApiError(422, "validation_error", f"listing_type must be at most {MAX_LISTING_TYPE_FILTER_LENGTH} characters")
     if q is not None and len(q) > MAX_SEARCH_Q_LENGTH:
@@ -153,18 +164,20 @@ async def search_listings(
         limit=limit,
         offset=offset,
         cursor=decoded,
+        include_test=include_test,
     )
     listings = await asyncio.gather(*(_to_response(row) for row in rows))
     next_cursor = encode_cursor(last_activity_at(rows[-1]), rows[-1]["id"]) if rows and has_more else None
     return ListingsPage(listings=list(listings), total=total, limit=limit, offset=offset, next_cursor=next_cursor)
 
 
-def _duplicate_error(existing_id: str) -> ApiError:
+def _duplicate_error(existing_id: str, is_test: bool = False) -> ApiError:
     return ApiError(
         409,
         "duplicate_listing",
-        "An active offering with the same normalized endpoint_url and submitted_by already exists. "
-        "Nothing was created or changed.",
+        "An active offering with the same normalized endpoint_url and submitted_by already exists"
+        + (" (among test listings)" if is_test else "")
+        + ". Nothing was created or changed.",
         extras={"existing_listing_id": existing_id},
     )
 
@@ -190,24 +203,31 @@ async def create_listing(payload: ListingCreate) -> ListingResponse:
             "submitted_by is a publicly known example address (its private key is public), so anyone could sign "
             "for this listing. Use a wallet you control.",
         )
+    is_test = demo_data.is_test_name(payload.name)
+    await asyncio.to_thread(maintenance.maybe_purge)
     if payload.listing_type == DUPLICATE_GUARDED_LISTING_TYPE:
-        existing_id = await asyncio.to_thread(db.find_active_duplicate, payload.endpoint_url, payload.submitted_by)
+        existing_id = await asyncio.to_thread(
+            db.find_active_duplicate, payload.endpoint_url, payload.submitted_by, None, is_test
+        )
         if existing_id is not None:
-            raise _duplicate_error(existing_id)
+            raise _duplicate_error(existing_id, is_test)
 
     now = datetime.now(timezone.utc)
     row = {
         **payload.model_dump(),
         "id": str(uuid.uuid4()),
         "status": "active",
+        "is_test": is_test,
         "created_at": now,
         "updated_at": now,
     }
     try:
         created = await asyncio.to_thread(db.create_listing, row)
     except db.UniqueViolation:  # lost a race with a concurrent identical POST
-        existing_id = await asyncio.to_thread(db.find_active_duplicate, payload.endpoint_url, payload.submitted_by)
-        raise _duplicate_error(existing_id or "unknown") from None
+        existing_id = await asyncio.to_thread(
+            db.find_active_duplicate, payload.endpoint_url, payload.submitted_by, None, is_test
+        )
+        raise _duplicate_error(existing_id or "unknown", is_test) from None
     return await _to_response(created)
 
 
@@ -224,6 +244,10 @@ async def browse_listings(
         max_length=MAX_CURSOR_LENGTH,
         description="next_cursor from the previous page. Order: newest last activity first.",
     ),
+    include_test: bool = Query(
+        default=False,
+        description="Also include temporary test listings (names starting 'test-'), hidden by default.",
+    ),
 ) -> ListingsPage:
     return await search_listings(
         listing_type=listing_type,
@@ -233,6 +257,7 @@ async def browse_listings(
         limit=limit,
         offset=offset,
         cursor=cursor,
+        include_test=include_test,
     )
 
 
@@ -258,6 +283,13 @@ async def update_listing(listing_id: ListingIdPath, payload: ListingUpdate, requ
     patch = payload.model_dump(exclude_unset=True)
     if not patch:
         raise ApiError(422, "empty_patch", "Patch body is empty; nothing to update.")
+    if "name" in patch and demo_data.is_test_name(patch["name"]) != existing["is_test"]:
+        raise ApiError(
+            422,
+            "invalid_test_name",
+            "The 'test-' name prefix marks a listing as temporary test data; it can only be set when a listing "
+            "is created and cannot be added to or removed from an existing listing's name.",
+        )
 
     raw_body = await _raw_body_dict(request)
     verify_wallet_auth(
@@ -284,9 +316,10 @@ async def update_listing(listing_id: ListingIdPath, payload: ListingUpdate, requ
             patch.get("endpoint_url", existing["endpoint_url"]),
             existing["submitted_by"],
             listing_id,
+            existing["is_test"],
         )
         if clash is not None:
-            raise _duplicate_error(clash)
+            raise _duplicate_error(clash, existing["is_test"])
 
     try:
         updated = await asyncio.to_thread(
@@ -298,8 +331,9 @@ async def update_listing(listing_id: ListingIdPath, payload: ListingUpdate, requ
             patch.get("endpoint_url", existing["endpoint_url"]),
             existing["submitted_by"],
             listing_id,
+            existing["is_test"],
         )
-        raise _duplicate_error(clash or "unknown") from None
+        raise _duplicate_error(clash or "unknown", existing["is_test"]) from None
     return await _to_response(updated)
 
 

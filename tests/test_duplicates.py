@@ -222,7 +222,7 @@ def test_the_database_guard_is_a_partial_index_on_offerings_only() -> None:
     def row(listing_type: str) -> dict:
         now = datetime.now(timezone.utc)
         model = ListingCreate(**listing_payload(listing_type, "0x" + "ab" * 20, endpoint_url="https://index-check.example.com/a"))
-        return {**model.model_dump(), "id": str(uuid.uuid4()), "status": "active", "created_at": now, "updated_at": now}
+        return {**model.model_dump(), "id": str(uuid.uuid4()), "status": "active", "is_test": False, "created_at": now, "updated_at": now}
 
     for _ in range(3):
         db.create_listing(row("announcement"))  # no violation

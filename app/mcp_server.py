@@ -54,7 +54,8 @@ TOOL_DESCRIPTION = (
     "'no data', never as something negative about that listing. Results are "
     "ordered by most recent activity first; each carries `stale` (true when there "
     "has been no activity for over 60 days by default) and the page carries "
-    "`next_cursor` for stable pagination. Free to call, no payment or account "
+    "`next_cursor` for stable pagination. Temporary demo listings (names starting "
+    "'test-') are hidden unless include_test is set. Free to call, no payment or account "
     "required. Errors come back as isError results with a stable `error_code` and "
     "`next_actions`."
 )
@@ -156,6 +157,14 @@ async def _search_listings_tool(
         str | None,
         Field(default=None, description="next_cursor from the previous page's result; omit for the first page."),
     ] = None,
+    include_test: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Also include temporary test listings (names starting 'test-'); hidden by default because "
+            "they are demo data that is purged after about a day.",
+        ),
+    ] = False,
     ctx: Context | None = None,
 ) -> CallToolResult:
     try:
@@ -172,6 +181,7 @@ async def _search_listings_tool(
             limit=limit,
             offset=offset,
             cursor=cursor,
+            include_test=include_test,
         )
     except HTTPException as exc:
         return _error_result(exc)

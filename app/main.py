@@ -1,4 +1,4 @@
-import logging
+import asyncio
 from contextlib import asynccontextmanager
 
 # .env is loaded as a side effect of importing the app package (see app/__init__.py)
@@ -11,7 +11,8 @@ from app.api.routes.health import router as health_router
 from app.api.routes.listings import router as listings_router
 from app.api.routes.site_meta import router as site_meta_router
 from app.core.constants import SERVICE_NAME, SERVICE_VERSION
-from app.core.db import close_db, init_db
+from app.core.db import close_db
+from app.core.maintenance import startup_maintenance
 from app.core.errors import ERROR_CODES, error_codes_manifest, install_error_handlers
 from app.core.limits import MaxBodySizeMiddleware
 from app.core.request_logging import ErrorRequestLoggingMiddleware
@@ -33,14 +34,11 @@ APP_DESCRIPTION = (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Open the DB connection pool and create the schema once, here, rather than on
-    # every request. Best-effort: if the database is briefly unreachable at boot the
-    # service still starts, and the first request that needs the DB retries the same
+    # Open the DB connection pool, create/migrate the schema, and purge expired test
+    # listings, once, here. Best-effort: if the database is briefly unreachable at boot
+    # the service still starts, and the first request that needs the DB retries the same
     # initialization (see app/core/db.py's lazy _ensure_schema).
-    try:
-        init_db()
-    except Exception:  # noqa: BLE001
-        logging.getLogger("app.db").exception("Database init at startup failed; will retry on first use")
+    await asyncio.to_thread(startup_maintenance)
     # A mounted sub-app's own lifespan doesn't run, so the MCP session manager is
     # started here for the lifetime of the service instead.
     async with mcp_server.session_manager.run():
