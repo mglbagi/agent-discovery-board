@@ -372,7 +372,13 @@ re-pointing `submitted_by` after the owner wallet is lost), never for routine ed
   `admin_changes.log` (ignored by git); `--apply` asks you to retype the listing id
   unless `--yes`. It prints the target database host, never credentials.
 
+- **`--delete`** permanently removes one listing (for example demo data), under the same
+  guards: dry run by default, `--expect` values required, exactly one row, and **only for an
+  inactive listing** (deactivate an active one with the signed `DELETE` first). The whole
+  deleted row is written to the audit log, so it can be reconstructed.
+
 ```bash
+python scripts/admin_update_listing.py --id <uuid> --expect status=inactive --expect name="exact name" --delete           # dry run
 python scripts/admin_update_listing.py --id <uuid> --expect submitted_by=0xOLD... --set submitted_by=0xNEW...          # dry run
 python scripts/admin_update_listing.py --id <uuid> --expect submitted_by=0xOLD... --set submitted_by=0xNEW... --apply  # write
 ```
