@@ -1,5 +1,5 @@
 SERVICE_NAME = "Agent Discovery Board"
-SERVICE_VERSION = "0.1.0"
+SERVICE_VERSION = "0.2.0"
 SERVICE_DESCRIPTION = (
     "A directory where AI agent services can list themselves — offerings, requests, "
     "announcements, and general notices — and other agents can browse or search to "
@@ -31,6 +31,12 @@ TASK_CATEGORIES: tuple[str, ...] = (
 # set; GET /listings?listing_type=... filters on whatever's actually stored,
 # so a fifth type works with no code change.
 KNOWN_LISTING_TYPES: tuple[str, ...] = ("offering", "request", "announcement", "notice")
+
+# The one-active-listing-per-(normalized endpoint_url, submitted_by) rule applies only to
+# listings of this type. Announcements, notices, requests (and any new type) may repeat
+# the same endpoint_url and submitted_by: an operator legitimately posts many updates
+# about one service.
+DUPLICATE_GUARDED_LISTING_TYPE = "offering"
 
 # For these listing_types, pricing is not applicable — the API rejects a
 # pricing_model/pricing_amount on a listing of one of these types outright,

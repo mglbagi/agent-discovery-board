@@ -17,7 +17,12 @@ from typing import Any, Iterator
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
+
+from app.core.activity import ACTIVITY_SQL
+from app.core.constants import DUPLICATE_GUARDED_LISTING_TYPE
+from app.core.endpoint import normalize_endpoint_url
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -33,6 +38,10 @@ _POOL_TIMEOUT_SECONDS = float(os.getenv("DB_POOL_TIMEOUT_SECONDS", "10"))
 _pool: ConnectionPool | None = None
 _schema_ready = False
 _state_lock = threading.Lock()
+
+# Raised by create/update when the partial unique index (one ACTIVE offering per
+# normalized endpoint_url + submitter) rejects a write; the route maps it to 409.
+UniqueViolation = psycopg.errors.UniqueViolation
 
 
 def _get_pool() -> ConnectionPool:
@@ -91,6 +100,15 @@ def _ensure_schema() -> None:
                 )
                 """
             )
+            # Additive migrations for tables created by earlier versions.
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ")
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS payment_options JSONB NOT NULL DEFAULT '[]'::jsonb")
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS endpoint_key TEXT")
+            for row in conn.execute("SELECT id, endpoint_url FROM listings WHERE endpoint_key IS NULL").fetchall():
+                conn.execute(
+                    "UPDATE listings SET endpoint_key = %s WHERE id = %s",
+                    (normalize_endpoint_url(row["endpoint_url"]), row["id"]),
+                )
             # Every read filters on one or more of these; an externally reachable,
             # unauthenticated GET /listings must not be a sequential scan.
             for stmt in (
@@ -99,8 +117,20 @@ def _ensure_schema() -> None:
                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS listings_listing_type_idx ON listings (listing_type)",
                 "CREATE INDEX CONCURRENTLY IF NOT EXISTS listings_task_categories_gin_idx "
                 "ON listings USING GIN (task_categories)",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS listings_activity_idx "
+                f"ON listings (({ACTIVITY_SQL}) DESC, id DESC)",
             ):
                 conn.execute(stmt)
+            # Atomic duplicate guard: at most one ACTIVE listing of the guarded type
+            # (offering) per (normalized endpoint, submitter). Announcements, notices and
+            # requests are exempt. Not CONCURRENTLY, so a pre-existing duplicate makes
+            # this fail cleanly instead of leaving an invalid index behind.
+            conn.execute("DROP INDEX IF EXISTS listings_active_endpoint_owner_uniq")  # earlier, all-types version
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS listings_active_offering_endpoint_owner_uniq "
+                "ON listings (endpoint_key, lower(submitted_by)) "
+                f"WHERE status = 'active' AND listing_type = '{DUPLICATE_GUARDED_LISTING_TYPE}'"
+            )
         _schema_ready = True
 
 
@@ -124,47 +154,82 @@ def _connection() -> Iterator[psycopg.Connection]:
         yield conn
 
 
+# Columns returned to callers (endpoint_key is internal).
 _COLUMNS = (
     "id", "name", "description", "listing_type", "task_categories", "endpoint_url",
-    "payment_wallet", "pricing_model", "pricing_amount", "erc8004_identity",
-    "verification_agent_id", "submitted_by", "status", "created_at", "updated_at",
+    "payment_wallet", "pricing_model", "pricing_amount", "payment_options", "erc8004_identity",
+    "verification_agent_id", "submitted_by", "status", "created_at", "updated_at", "last_seen_at",
 )
+_READ = ", ".join(_COLUMNS)
+_WRITE_COLUMNS = _COLUMNS[:-1] + ("endpoint_key",)  # last_seen_at is only ever set by heartbeat
+
+
+def _prepare(params: dict[str, Any]) -> dict[str, Any]:
+    out = dict(params)
+    if "payment_options" in out:
+        out["payment_options"] = Jsonb(out["payment_options"] or [])
+    return out
 
 
 def create_listing(row: dict[str, Any]) -> dict[str, Any]:
-    cols = _COLUMNS
-    placeholders = ", ".join(f"%({c})s" for c in cols)
+    row = {**row, "endpoint_key": normalize_endpoint_url(row["endpoint_url"])}
+    placeholders = ", ".join(f"%({c})s" for c in _WRITE_COLUMNS)
     with _connection() as conn:
         return conn.execute(
-            f"INSERT INTO listings ({', '.join(cols)}) VALUES ({placeholders}) "
-            f"RETURNING {', '.join(cols)}",
-            row,
+            f"INSERT INTO listings ({', '.join(_WRITE_COLUMNS)}) VALUES ({placeholders}) RETURNING {_READ}",
+            _prepare(row),
         ).fetchone()
 
 
 def get_listing(listing_id: str) -> dict[str, Any] | None:
     with _connection() as conn:
-        return conn.execute(
-            f"SELECT {', '.join(_COLUMNS)} FROM listings WHERE id = %s", (listing_id,)
+        return conn.execute(f"SELECT {_READ} FROM listings WHERE id = %s", (listing_id,)).fetchone()
+
+
+def find_active_duplicate(endpoint_url: str, submitted_by: str, exclude_id: str | None = None) -> str | None:
+    """id of the ACTIVE offering (the only guarded type) with the same normalized endpoint
+    and submitter, if any."""
+    with _connection() as conn:
+        row = conn.execute(
+            "SELECT id FROM listings WHERE endpoint_key = %s AND lower(submitted_by) = lower(%s) "
+            "AND status = 'active' AND listing_type = %s AND (%s::text IS NULL OR id <> %s) LIMIT 1",
+            (normalize_endpoint_url(endpoint_url), submitted_by, DUPLICATE_GUARDED_LISTING_TYPE, exclude_id, exclude_id),
         ).fetchone()
+    return row["id"] if row else None
 
 
 def update_listing(listing_id: str, patch: dict[str, Any]) -> dict[str, Any] | None:
     """`patch` may contain any subset of the mutable columns (never id/submitted_by/
     created_at — the route layer never passes those). Always bumps updated_at, which
-    the caller supplies alongside the rest of `patch`."""
+    the caller supplies alongside the rest of `patch`. A changed endpoint_url gets its
+    endpoint_key recomputed here so the two can never drift."""
     if not patch:
         raise ValueError("patch must not be empty")
+    patch = dict(patch)
+    if "endpoint_url" in patch:
+        patch["endpoint_key"] = normalize_endpoint_url(patch["endpoint_url"])
     set_clause = ", ".join(f"{col} = %({col})s" for col in patch)
     with _connection() as conn:
         return conn.execute(
-            f"UPDATE listings SET {set_clause} WHERE id = %(id)s RETURNING {', '.join(_COLUMNS)}",
-            {**patch, "id": listing_id},
+            f"UPDATE listings SET {set_clause} WHERE id = %(id)s RETURNING {_READ}",
+            {**_prepare(patch), "id": listing_id},
         ).fetchone()
 
 
 def set_listing_status(listing_id: str, status: str, now: datetime) -> dict[str, Any] | None:
     return update_listing(listing_id, {"status": status, "updated_at": now})
+
+
+def record_heartbeat(listing_id: str, now: datetime, cutoff: datetime) -> dict[str, Any] | None:
+    """Set last_seen_at = now, but only if the previous heartbeat is at or before
+    `cutoff` (or there was none). Conditional in SQL, so two concurrent heartbeats
+    cannot both succeed inside one window. Returns None when nothing was updated."""
+    with _connection() as conn:
+        return conn.execute(
+            f"UPDATE listings SET last_seen_at = %(now)s WHERE id = %(id)s AND status = 'active' "
+            f"AND (last_seen_at IS NULL OR last_seen_at <= %(cutoff)s) RETURNING {_READ}",
+            {"now": now, "id": listing_id, "cutoff": cutoff},
+        ).fetchone()
 
 
 def list_listings(
@@ -175,7 +240,11 @@ def list_listings(
     status: str | None,
     limit: int,
     offset: int,
-) -> tuple[list[dict[str, Any]], int]:
+    cursor: tuple[datetime, str] | None = None,
+) -> tuple[list[dict[str, Any]], int, bool]:
+    """Returns (page of rows, total matching the filters, whether more rows follow).
+    Order is newest last activity first, id as the tiebreaker - a total order, so a
+    cursor (last_activity_at, id) is a stable resume point."""
     conditions: list[str] = []
     params: dict[str, Any] = {}
 
@@ -197,12 +266,20 @@ def list_listings(
         conditions.append("(name ILIKE %(q)s ESCAPE '\\' OR description ILIKE %(q)s ESCAPE '\\')")
         params["q"] = f"%{escaped}%"
 
-    where = " AND ".join(conditions)
+    total_where = " AND ".join(conditions)
+
+    page_conditions = list(conditions)
+    page_params = dict(params)
+    if cursor is not None:
+        page_conditions.append(f"(({ACTIVITY_SQL}), id) < (%(cursor_activity)s, %(cursor_id)s)")
+        page_params["cursor_activity"], page_params["cursor_id"] = cursor
+    page_where = " AND ".join(page_conditions)
+
     with _connection() as conn:
-        total = conn.execute(f"SELECT COUNT(*) AS n FROM listings WHERE {where}", params).fetchone()["n"]
+        total = conn.execute(f"SELECT COUNT(*) AS n FROM listings WHERE {total_where}", params).fetchone()["n"]
         rows = conn.execute(
-            f"SELECT {', '.join(_COLUMNS)} FROM listings WHERE {where} "
-            "ORDER BY created_at DESC LIMIT %(limit)s OFFSET %(offset)s",
-            {**params, "limit": limit, "offset": offset},
+            f"SELECT {_READ} FROM listings WHERE {page_where} "
+            f"ORDER BY ({ACTIVITY_SQL}) DESC, id DESC LIMIT %(limit)s OFFSET %(offset)s",
+            {**page_params, "limit": limit + 1, "offset": offset},
         ).fetchall()
-    return rows, total
+    return rows[:limit], total, len(rows) > limit

@@ -19,7 +19,7 @@ from mcp.client.streamable_http import streamablehttp_client
 
 from app.core.rate_limit import mcp_search_limiter
 from app.main import app
-from tests.helpers import listing_payload, wallet_auth_header
+from tests.helpers import assert_error_body, listing_payload, wallet_auth_header
 
 # The app's lifespan enters mcp_server.session_manager.run() (app/main.py), and the
 # MCP SDK only allows that exactly once per FastMCP instance - app.main.mcp_server is
@@ -147,8 +147,10 @@ async def test_unknown_task_category_is_a_tool_error_not_a_crash(live_server) ->
     result = await _call_tool(live_server, "search_listings", {"task_category": ["not-a-real-category"]})
     assert result.isError is True
     body = _body(result)
-    assert body["status"] == 422
+    assert body["status"] == 422  # the tool's original keys are unchanged...
     assert "not-a-real-category" in body["error"]
+    assert_error_body(body, "invalid_task_category")  # ...and the machine-readable ones are added
+    assert body["next_actions"][0]["method"] == "MCP_TOOL" and body["next_actions"][0]["path"] == "search_listings"
 
 
 async def test_deactivated_listings_excluded_by_default_via_mcp(live_server) -> None:
@@ -191,7 +193,53 @@ async def test_search_listings_tool_is_rate_limited(live_server) -> None:
         body = _body(limited)
         assert body["status"] == 429
         assert body["retryable"] is True
+        assert_error_body(body, "rate_limited")
+        assert isinstance(body["retry_after"], int) and body["retry_after"] >= 1
+        assert str(body["retry_after"]) in body["next_actions"][0]["description"]
     finally:
         mcp_search_limiter.max_requests = 30
         mcp_search_limiter.window_seconds = 60.0
         mcp_search_limiter.reset()
+
+
+async def test_results_carry_freshness_fields_and_are_newest_activity_first(live_server) -> None:
+    marker = "mcp-fresh-" + Account.create().address[-8:]
+    old = await _create_via_rest(live_server, name=f"Old {marker}")
+    new = await _create_via_rest(live_server, name=f"New {marker}")
+    from tests.helpers import set_listing_times
+
+    set_listing_times(old["id"], created_days_ago=90, updated_days_ago=90, last_seen_hours_ago=None)
+
+    body = _body(await _call_tool(live_server, "search_listings", {"q": marker}))
+    assert [i["id"] for i in body["listings"]] == [new["id"], old["id"]]
+    by_id = {i["id"]: i for i in body["listings"]}
+    assert by_id[old["id"]]["stale"] is True and by_id[new["id"]]["stale"] is False
+    assert {"last_seen_at", "last_activity_at", "payment_options"} <= set(by_id[new["id"]])
+    assert body["next_cursor"] is None
+
+
+async def test_cursor_pagination_via_mcp_matches_rest(live_server) -> None:
+    marker = "mcp-cursor-" + Account.create().address[-8:]
+    created = {(await _create_via_rest(live_server, name=f"C {marker} {i}"))["id"] for i in range(5)}
+
+    seen, cursor = [], None
+    for _ in range(10):
+        args = {"q": marker, "limit": 2, **({"cursor": cursor} if cursor else {})}
+        body = _body(await _call_tool(live_server, "search_listings", args))
+        seen += [i["id"] for i in body["listings"]]
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+    assert len(seen) == len(set(seen)) and set(seen) == created
+
+    async with httpx.AsyncClient() as http:
+        rest = (await http.get(f"{live_server}/listings", params={"q": marker, "limit": 100})).json()
+    assert seen == [i["id"] for i in rest["listings"]]
+
+
+async def test_a_bad_cursor_via_mcp_is_a_coded_error(live_server) -> None:
+    result = await _call_tool(live_server, "search_listings", {"cursor": "not-a-cursor"})
+    assert result.isError is True
+    body = _body(result)
+    assert_error_body(body, "invalid_cursor")
+    assert body["next_actions"][0]["description"].startswith("Call again without a cursor")

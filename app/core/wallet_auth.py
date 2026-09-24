@@ -17,7 +17,7 @@ What gets signed
     nonce: <client-chosen random string>
     body_sha256: <hex sha256 of the canonical JSON PATCH body>
 
-`delete-listing` omits the `body_sha256` line (there is no body). The server
+`delete-listing` and `heartbeat-listing` omit the `body_sha256` line (there is no body). The server
 computes `body_sha256` itself, from the request body it actually received
 (app/core/canonical.py) — it never trusts a claim about what was signed. So
 tampering with the body after it was signed doesn't produce "signature
@@ -56,11 +56,23 @@ import threading
 import time
 from typing import Any
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 
 from app.core.canonical import canonical_json
+from app.core.errors import ApiError
 
 SIGNATURE_MAX_AGE_SECONDS = float(os.getenv("SIGNATURE_MAX_AGE_SECONDS", "300"))
+
+MESSAGE_FIRST_LINE = "Agent Discovery Board"
+
+# Every action a signature can authorize. The action name is inside the signed message,
+# so a signature for one action can never authorize another. Published, via
+# app/core/signing_spec.py, in the discovery manifest.
+SIGNED_ACTIONS: dict[str, dict[str, Any]] = {
+    "update-listing": {"method": "PATCH", "path": "/listings/{id}", "signs_body_hash": True},
+    "delete-listing": {"method": "DELETE", "path": "/listings/{id}", "signs_body_hash": False},
+    "heartbeat-listing": {"method": "POST", "path": "/listings/{id}/heartbeat", "signs_body_hash": False},
+}
 _MAX_TRACKED_NONCES = 50_000
 _HEADER_NAME = "x-wallet-auth"
 
@@ -95,8 +107,10 @@ def _claim_nonce(address_lower: str, nonce: str) -> bool:
 
 
 def _build_message(*, action: str, listing_id: str, timestamp: int, nonce: str, body: dict[str, Any] | None) -> str:
+    if action not in SIGNED_ACTIONS:
+        raise RuntimeError(f"unknown signed action {action!r}")
     lines = [
-        "Agent Discovery Board",
+        MESSAGE_FIRST_LINE,
         f"action: {action}",
         f"listing_id: {listing_id}",
         f"timestamp: {timestamp}",
@@ -111,7 +125,7 @@ def _build_message(*, action: str, listing_id: str, timestamp: int, nonce: str, 
 def _parse_header(request: Request) -> tuple[str, int, str]:
     raw = request.headers.get(_HEADER_NAME)
     if not raw:
-        raise HTTPException(status_code=401, detail=f"Missing {_HEADER_NAME.upper()} header.")
+        raise ApiError(401, "missing_signature", f"Missing {_HEADER_NAME.upper()} header.")
     try:
         decoded = base64.b64decode(raw, validate=True)
         payload = json.loads(decoded)
@@ -123,9 +137,10 @@ def _parse_header(request: Request) -> tuple[str, int, str]:
         if not (1 <= len(nonce) <= 128):
             raise ValueError("nonce length out of range")
     except (binascii.Error, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-        raise HTTPException(
-            status_code=401,
-            detail=f"{_HEADER_NAME.upper()} header is malformed. Expected base64 of "
+        raise ApiError(
+            401,
+            "malformed_signature",
+            f"{_HEADER_NAME.upper()} header is malformed. Expected base64 of "
             '{"signature": "0x...", "timestamp": <int>, "nonce": "<string>"}.',
         ) from exc
     return signature, timestamp, nonce
@@ -134,21 +149,23 @@ def _parse_header(request: Request) -> tuple[str, int, str]:
 def verify_wallet_auth(
     request: Request, *, action: str, listing_id: str, submitted_by: str, body: dict[str, Any] | None
 ) -> None:
-    """Raises HTTPException(401) or HTTPException(403) on any failure; returns
-    None (does nothing) on success."""
+    """Raises ApiError (an HTTPException: 401, or 403 for wrong_signer) on any failure;
+    returns None (does nothing) on success."""
     signature, timestamp, nonce = _parse_header(request)
 
     now = int(time.time())
     if abs(now - timestamp) > SIGNATURE_MAX_AGE_SECONDS:
-        raise HTTPException(
-            status_code=401,
-            detail=f"Signature timestamp is stale or from the future (must be within "
+        raise ApiError(
+            401,
+            "stale_signature",
+            f"Signature timestamp is stale or from the future (must be within "
             f"{SIGNATURE_MAX_AGE_SECONDS:.0f}s of the server's clock).",
+            extras={"server_time": now, "max_age_seconds": int(SIGNATURE_MAX_AGE_SECONDS)},
         )
 
     submitted_by_lower = submitted_by.lower()
     if not _claim_nonce(submitted_by_lower, nonce):
-        raise HTTPException(status_code=401, detail="This (wallet, nonce) pair has already been used.")
+        raise ApiError(401, "replayed_signature", "This (wallet, nonce) pair has already been used.")
 
     message = _build_message(action=action, listing_id=listing_id, timestamp=timestamp, nonce=nonce, body=body)
 
@@ -158,10 +175,11 @@ def verify_wallet_auth(
     try:
         recovered = Account.recover_message(encode_defunct(text=message), signature=signature)
     except Exception as exc:  # noqa: BLE001 — any malformed/invalid signature bytes
-        raise HTTPException(status_code=401, detail="Signature is not a valid Ethereum signature.") from exc
+        raise ApiError(401, "invalid_signature", "Signature is not a valid Ethereum signature.") from exc
 
     if recovered.lower() != submitted_by_lower:
-        raise HTTPException(
-            status_code=403,
-            detail="Signature is valid but was not made by this listing's submitted_by address.",
+        raise ApiError(
+            403,
+            "wrong_signer",
+            "Signature is valid but was not made by this listing's submitted_by address.",
         )

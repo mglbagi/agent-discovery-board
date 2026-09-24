@@ -3,6 +3,8 @@ import os
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
+from app.core.errors import build_error_body
+
 # No user-supplied JSON Schema or regex ever gets executed by this service (that
 # risk belongs to the verification service, not this one), so there's no ReDoS
 # surface here — this cap exists purely as ordinary request-size hygiene.
@@ -31,7 +33,13 @@ class MaxBodySizeMiddleware:
             except ValueError:
                 too_big = False
             if too_big:
-                await JSONResponse({"detail": "Request body too large"}, status_code=413)(scope, receive, send)
+                body = build_error_body(
+                    code="body_too_large",
+                    detail="Request body too large",
+                    method=scope.get("method", ""),
+                    path=scope.get("path", ""),
+                )
+                await JSONResponse(body, status_code=413)(scope, receive, send)
                 return
 
         total = 0

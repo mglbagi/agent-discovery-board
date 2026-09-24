@@ -33,6 +33,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.api.routes.listings import search_listings
 from app.core.constants import KNOWN_LISTING_TYPES, TASK_CATEGORIES
+from app.core.errors import MCP_TOOL_METHOD, action, build_error_body, resolve_http_exception
 from app.core.rate_limit import mcp_search_limiter
 
 SERVER_NAME = "Agent Discovery Board"
@@ -50,8 +51,12 @@ TOOL_DESCRIPTION = (
     "lookup, performed against a separate verification service, that reflects "
     "actual measured history for that listing's endpoint - treat `badge` as the "
     "only evidence-backed signal in a result, and its absence (null) as simply "
-    "'no data', never as something negative about that listing. Free to call, no "
-    "payment or account required."
+    "'no data', never as something negative about that listing. Results are "
+    "ordered by most recent activity first; each carries `stale` (true when there "
+    "has been no activity for over 60 days by default) and the page carries "
+    "`next_cursor` for stable pagination. Free to call, no payment or account "
+    "required. Errors come back as isError results with a stable `error_code` and "
+    "`next_actions`."
 )
 
 SERVER_INSTRUCTIONS = (
@@ -92,8 +97,32 @@ def _client_ip(ctx: Context | None) -> str:
     return "unknown"
 
 
-def _error_result(status: int, detail: str) -> CallToolResult:
-    body = {"error": detail, "status": status, "retryable": status == 429}
+def _mcp_next_actions(code: str, extras: dict) -> list[dict]:
+    if code == "rate_limited":
+        wait = extras.get("retry_after")
+        when = f"after {wait} seconds" if wait is not None else "later"
+        return [action(MCP_TOOL_METHOD, TOOL_NAME, [], f"Call {TOOL_NAME} again {when}.")]
+    if code == "invalid_cursor":
+        return [action(MCP_TOOL_METHOD, TOOL_NAME, [], "Call again without a cursor to restart from the first page.")]
+    return [
+        action(MCP_TOOL_METHOD, TOOL_NAME, [], "Correct the argument named in `detail` and call again."),
+        action("GET", "/.well-known/agent-card.json", [], "Fetch allowed values (task categories, listing types) and error codes."),
+    ]
+
+
+def _error_result(exc: HTTPException) -> CallToolResult:
+    """Same machine-readable shape as the REST errors (error_code, message, detail,
+    next_actions), plus the tool's original `error`, `status` and `retryable` keys."""
+    code, extras, _ = resolve_http_exception(exc)
+    body = build_error_body(
+        code=code,
+        detail=exc.detail,
+        method=MCP_TOOL_METHOD,
+        path=TOOL_NAME,
+        extras=extras,
+        next_actions=_mcp_next_actions(code, extras),
+    )
+    body.update({"error": str(exc.detail), "status": exc.status_code, "retryable": exc.status_code == 429})
     return CallToolResult(content=[TextContent(type="text", text=json.dumps(body))], isError=True)
 
 
@@ -122,20 +151,30 @@ async def _search_listings_tool(
         Field(default=None, description="Filter by status, 'active' or 'inactive'. Defaults to 'active' only."),
     ] = None,
     limit: Annotated[int, Field(default=20, ge=1, le=100, description="Maximum results to return, 1-100.")] = 20,
-    offset: Annotated[int, Field(default=0, ge=0, description="Pagination offset.")] = 0,
+    offset: Annotated[int, Field(default=0, ge=0, description="Legacy offset paging; prefer cursor.")] = 0,
+    cursor: Annotated[
+        str | None,
+        Field(default=None, description="next_cursor from the previous page's result; omit for the first page."),
+    ] = None,
     ctx: Context | None = None,
 ) -> CallToolResult:
     try:
         mcp_search_limiter.check_ip(_client_ip(ctx))
     except HTTPException as exc:
-        return _error_result(exc.status_code, str(exc.detail))
+        return _error_result(exc)
 
     try:
         page = await search_listings(
-            listing_type=listing_type, task_category=task_category, q=q, status=status, limit=limit, offset=offset
+            listing_type=listing_type,
+            task_category=task_category,
+            q=q,
+            status=status,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,
         )
     except HTTPException as exc:
-        return _error_result(exc.status_code, str(exc.detail))
+        return _error_result(exc)
 
     return CallToolResult(
         content=[TextContent(type="text", text=page.model_dump_json())],

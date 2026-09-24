@@ -136,6 +136,20 @@ def main() -> None:
     response.raise_for_status()
     print(f"  patched pricing_amount -> {response.json()['pricing_amount']}")
 
+    _print_header("4b. Duplicate detection, and a signed heartbeat")
+    duplicate = http.post("/listings", json=listings["offering"])
+    body = duplicate.json()
+    print(f"  re-POST of the offering -> {duplicate.status_code} {body['error_code']}, existing_listing_id={body['existing_listing_id']}")
+    assert duplicate.status_code == 409 and body["existing_listing_id"] == offering_id
+    header = _wallet_auth_header(account, action="heartbeat-listing", listing_id=offering_id, body=None)
+    beat = http.post(f"/listings/{offering_id}/heartbeat", headers={"X-Wallet-Auth": header})
+    beat.raise_for_status()
+    print(f"  heartbeat -> last_seen_at={beat.json()['last_seen_at']}, next allowed {beat.json()['next_heartbeat_allowed_at']}")
+    header = _wallet_auth_header(account, action="heartbeat-listing", listing_id=offering_id, body=None)
+    again = http.post(f"/listings/{offering_id}/heartbeat", headers={"X-Wallet-Auth": header})
+    print(f"  second heartbeat -> {again.status_code} {again.json()['error_code']}, retry_after={again.json()['retry_after']}s")
+    assert again.status_code == 429
+
     _print_header("5. Deactivate a listing (wallet-signature auth)")
     notice_id = created["notice"]["id"]
     header = _wallet_auth_header(account, action="delete-listing", listing_id=notice_id, body=None)
