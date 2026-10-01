@@ -34,6 +34,7 @@ from app.core.models import (
     ListingResponse,
     ListingsPage,
     ListingUpdate,
+    RemovalResponse,
     Status,
     check_pricing_consistency,
 )
@@ -56,12 +57,13 @@ ListingIdPath = Annotated[
 
 _ERROR_DESCRIPTIONS = {
     401: "Signature missing, malformed, stale, replayed or invalid (error_code says which).",
-    403: "Valid signature, but not by the listing's submitted_by (error_code: wrong_signer).",
+    403: "Valid signature, but not by the expected address (error_code: wrong_signer; submitted_by, except "
+    "payment_wallet for /claim and /remove-imported).",
     404: "No such listing (error_code: not_found).",
     409: "duplicate_listing (an active offering with the same normalized endpoint_url and submitted_by exists; "
-    "see existing_listing_id) or listing_inactive.",
-    422: "Validation failed (error_code: validation_error, reserved_address, invalid_test_name or a more "
-    "specific code).",
+    "see existing_listing_id), listing_inactive, or already_claimed.",
+    422: "Validation failed (error_code: validation_error, reserved_address, invalid_test_name, not_imported "
+    "or a more specific code).",
     429: "rate_limited; see retry_after.",
 }
 
@@ -126,6 +128,7 @@ async def search_listings(
     offset: int = 0,
     cursor: str | None = None,
     include_test: bool = False,
+    claimed: bool | None = None,
 ) -> ListingsPage:
     """The single place that actually searches/filters listings and attaches trust
     badges. Both `GET /listings` below and the `search_listings` MCP tool
@@ -144,6 +147,9 @@ async def search_listings(
 
     Temporary `test-` listings are excluded unless include_test is set. This is also one of
     the cheap places that opportunistically purges expired test listings (throttled).
+
+    `claimed`: omitted applies no filter; true/false restrict to claimed or unclaimed
+    (imported, not yet claimed - see app/core/imports.py) listings.
     """
     await asyncio.to_thread(maintenance.maybe_purge)
     if listing_type is not None and len(listing_type) > MAX_LISTING_TYPE_FILTER_LENGTH:
@@ -173,6 +179,7 @@ async def search_listings(
         offset=offset,
         cursor=decoded,
         include_test=include_test,
+        claimed=claimed,
     )
 
     next_cursor = None
@@ -220,8 +227,9 @@ async def create_listing(payload: ListingCreate) -> ListingResponse:
         raise ApiError(
             422,
             "reserved_address",
-            "submitted_by is a publicly known example address (its private key is public), so anyone could sign "
-            "for this listing. Use a wallet you control.",
+            "submitted_by cannot be this address: either its private key is publicly known (anyone could sign "
+            "for this listing) or no private key can ever sign for it at all (you would lock yourself out). "
+            "Use a wallet you control.",
         )
     is_test = demo_data.is_test_name(payload.name)
     await asyncio.to_thread(maintenance.maybe_purge)
@@ -240,6 +248,13 @@ async def create_listing(payload: ListingCreate) -> ListingResponse:
         "is_test": is_test,
         "created_at": now,
         "updated_at": now,
+        # A listing submitted directly (not imported) is fully owned by submitted_by
+        # from the start - see app/core/imports.py.
+        "claimed": True,
+        "source": None,
+        "source_url": None,
+        "imported_at": None,
+        "last_synced_at": None,
     }
     try:
         created = await asyncio.to_thread(db.create_listing, row)
@@ -274,6 +289,11 @@ async def browse_listings(
         default=False,
         description="Also include temporary test listings (names starting 'test-'), hidden by default.",
     ),
+    claimed: bool | None = Query(
+        default=None,
+        description="Filter by claim status (see the `claimed` response field): true for claimed listings only, "
+        "false for unclaimed imports only, omitted for no filter.",
+    ),
 ) -> ListingsPage:
     return await search_listings(
         listing_type=listing_type,
@@ -284,6 +304,7 @@ async def browse_listings(
         offset=offset,
         cursor=cursor,
         include_test=include_test,
+        claimed=claimed,
     )
 
 
@@ -383,6 +404,76 @@ async def deactivate_listing(listing_id: ListingIdPath, request: Request) -> Lis
 
     updated = await asyncio.to_thread(db.set_listing_status, listing_id, "inactive", datetime.now(timezone.utc))
     return await _to_response(updated)
+
+
+@router.post(
+    "/listings/{listing_id}/claim",
+    response_model=ListingResponse,
+    dependencies=[Depends(rate_limit_listing_mutation)],
+    responses=_errors(401, 403, 404, 409, 429),
+)
+async def claim_listing(listing_id: ListingIdPath, request: Request) -> ListingResponse:
+    """For an imported, unclaimed listing (see app/core/imports.py): the real owner
+    proves control by signing with the wallet that matches payment_wallet - the same
+    EIP-191 scheme as PATCH, action `claim-listing`, no body. On success submitted_by
+    becomes that address and claimed becomes true, and the listing behaves exactly like
+    any other from then on. 409 already_claimed if it was claimed already (by anyone,
+    imported or not)."""
+    existing = await asyncio.to_thread(db.get_listing, listing_id)
+    if existing is None:
+        raise ApiError(404, "not_found", "No listing with this id.")
+    if existing["claimed"]:
+        raise ApiError(409, "already_claimed", "This listing has already been claimed.")
+
+    verify_wallet_auth(
+        request,
+        action="claim-listing",
+        listing_id=listing_id,
+        submitted_by=existing["payment_wallet"],
+        body=None,
+        expected_role="payment_wallet",
+    )
+
+    updated = await asyncio.to_thread(db.claim_listing, listing_id, existing["payment_wallet"], datetime.now(timezone.utc))
+    if updated is None:  # lost a race with a concurrent claim
+        raise ApiError(409, "already_claimed", "This listing has already been claimed.")
+    return await _to_response(updated)
+
+
+@router.post(
+    "/listings/{listing_id}/remove-imported",
+    response_model=RemovalResponse,
+    dependencies=[Depends(rate_limit_listing_mutation)],
+    responses=_errors(401, 403, 404, 422, 429),
+)
+async def remove_imported_listing(listing_id: ListingIdPath, request: Request) -> RemovalResponse:
+    """For an imported listing (see app/core/imports.py): the real pay-to owner signs to
+    have it removed immediately, whether or not it has been claimed yet - same scheme as
+    PATCH, action `remove-imported-listing`, no body, verified against payment_wallet.
+    Hard-deletes the listing and records its (source, endpoint) in a do-not-import list,
+    so a later sync never recreates it. 422 not_imported if source is not set (use the
+    normal signed DELETE for a listing that was not imported)."""
+    existing = await asyncio.to_thread(db.get_listing, listing_id)
+    if existing is None:
+        raise ApiError(404, "not_found", "No listing with this id.")
+    if existing["source"] is None:
+        raise ApiError(422, "not_imported", "This listing was not imported; use the normal signed DELETE instead.")
+
+    verify_wallet_auth(
+        request,
+        action="remove-imported-listing",
+        listing_id=listing_id,
+        submitted_by=existing["payment_wallet"],
+        body=None,
+        expected_role="payment_wallet",
+    )
+
+    removed = await asyncio.to_thread(
+        db.remove_imported_listing, listing_id, "removed by pay-to owner", datetime.now(timezone.utc)
+    )
+    if removed is None:
+        raise ApiError(404, "not_found", "No listing with this id.")
+    return RemovalResponse(id=listing_id, removed=True, do_not_import=True)
 
 
 @router.post(

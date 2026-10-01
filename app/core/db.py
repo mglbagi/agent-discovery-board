@@ -231,6 +231,37 @@ def _ensure_schema() -> None:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS search_log_searched_at_idx ON search_log (searched_at)")
+
+            # --- Imported listings (app/core/imports.py) ------------------------------------
+            # claimed defaults TRUE: every listing created the normal way (POST /listings) is
+            # fully owned by its submitted_by from the start. Only the import path explicitly
+            # sets it FALSE; existing rows (all organic) are correctly TRUE under this default.
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS claimed BOOLEAN NOT NULL DEFAULT TRUE")
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS source TEXT")
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS source_url TEXT")
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS imported_at TIMESTAMPTZ")
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS last_synced_at TIMESTAMPTZ")
+            # Set by a sync run that no longer finds this listing at its source; cleared again
+            # if a later sync finds it again. Feeds is_stale() (app/core/activity.py) directly,
+            # independent of the normal activity-age threshold.
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS missing_from_source_since TIMESTAMPTZ")
+            # One row per imported listing per source: re-syncing upserts by this pair rather
+            # than creating duplicates (app/core/db.py's import_upsert).
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS listings_source_endpoint_uniq "
+                "ON listings (source, endpoint_key) WHERE source IS NOT NULL"
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS do_not_import (
+                    source TEXT NOT NULL,
+                    endpoint_key TEXT NOT NULL,
+                    reason TEXT,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY (source, endpoint_key)
+                )
+                """
+            )
         _schema_ready = True
 
 
@@ -254,14 +285,18 @@ def _connection() -> Iterator[psycopg.Connection]:
         yield conn
 
 
-# Columns returned to callers (endpoint_key is internal).
+# Columns returned to callers (endpoint_key and missing_from_source_since are internal -
+# the latter only ever feeds is_stale(), never shown as its own response field).
 _COLUMNS = (
     "id", "name", "description", "listing_type", "task_categories", "endpoint_url",
     "payment_wallet", "pricing_model", "pricing_amount", "payment_options", "erc8004_identity",
     "verification_agent_id", "submitted_by", "status", "is_test", "created_at", "updated_at", "last_seen_at",
+    "claimed", "source", "source_url", "imported_at", "last_synced_at", "missing_from_source_since",
 )
+# last_seen_at is only ever set by heartbeat; missing_from_source_since only by a sync noticing
+# a listing is gone. Every create_listing() caller supplies the rest, including the import path.
+_WRITE_COLUMNS = tuple(c for c in _COLUMNS if c not in ("last_seen_at", "missing_from_source_since")) + ("endpoint_key",)
 _READ = ", ".join(_COLUMNS)
-_WRITE_COLUMNS = _COLUMNS[:-1] + ("endpoint_key",)  # last_seen_at is only ever set by heartbeat
 
 
 def _prepare(params: dict[str, Any]) -> dict[str, Any]:
@@ -271,8 +306,14 @@ def _prepare(params: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+# Defaults for columns a caller may not know or care about - an organic listing (the
+# overwhelming common case) is claimed from the start with no import metadata at all.
+# The import path (app/core/imports.py's build_import_row) always sets these explicitly.
+_CREATE_DEFAULTS = {"claimed": True, "source": None, "source_url": None, "imported_at": None, "last_synced_at": None}
+
+
 def create_listing(row: dict[str, Any]) -> dict[str, Any]:
-    row = {**row, "endpoint_key": normalize_endpoint_url(row["endpoint_url"])}
+    row = {**_CREATE_DEFAULTS, **row, "endpoint_key": normalize_endpoint_url(row["endpoint_url"])}
     placeholders = ", ".join(f"%({c})s" for c in _WRITE_COLUMNS)
     with _connection() as conn:
         return conn.execute(
@@ -342,10 +383,15 @@ def record_heartbeat(listing_id: str, now: datetime, cutoff: datetime) -> dict[s
 
 
 def _filter_conditions(
-    status: str | None, include_test: bool, listing_type: str | None, task_categories: list[str] | None
+    status: str | None,
+    include_test: bool,
+    listing_type: str | None,
+    task_categories: list[str] | None,
+    claimed: bool | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """The filters shared by every search mode below (status/include_test/listing_type/
-    task_categories) - everything except q itself, which each mode applies differently."""
+    task_categories/claimed) - everything except q itself, which each mode applies
+    differently."""
     conditions = ["status = %(status)s"]
     params: dict[str, Any] = {"status": status if status is not None else "active"}
     if not include_test:
@@ -356,6 +402,9 @@ def _filter_conditions(
     if task_categories:
         conditions.append("task_categories && %(task_categories)s::text[]")
         params["task_categories"] = task_categories
+    if claimed is not None:
+        conditions.append("claimed = %(claimed)s")
+        params["claimed"] = claimed
     return conditions, params
 
 
@@ -411,6 +460,7 @@ def list_listings(
     offset: int,
     cursor: AnyCursor | None = None,
     include_test: bool = False,
+    claimed: bool | None = None,
 ) -> tuple[list[dict[str, Any]], int, bool, str]:
     """Returns (page of rows, total matching the filters, whether more rows follow, mode).
 
@@ -434,8 +484,11 @@ def list_listings(
 
     Every search this is given (every call with a non-empty q) is logged to search_log:
     the query text, the total result count, and when - nothing else.
+
+    `claimed`: None (default) applies no filter; True/False restrict to claimed or
+    unclaimed (imported, not yet claimed) listings respectively.
     """
-    conditions, params = _filter_conditions(status, include_test, listing_type, task_categories)
+    conditions, params = _filter_conditions(status, include_test, listing_type, task_categories, claimed)
     where = " AND ".join(conditions)
 
     with _connection() as conn:
@@ -536,5 +589,120 @@ def purge_expired_test_listings(cutoff: datetime, limit: int) -> list[str]:
             "SELECT id FROM listings WHERE is_test AND created_at < %(cutoff)s ORDER BY created_at LIMIT %(limit)s"
             ") RETURNING id",
             {"cutoff": cutoff, "limit": limit},
+        ).fetchall()
+    return [r["id"] for r in rows]
+
+
+# ---- Imported listings (app/core/imports.py) ---------------------------------------------
+
+
+def claim_listing(listing_id: str, new_submitted_by: str, now: datetime) -> dict[str, Any] | None:
+    """Flips an unclaimed listing to claimed=True, submitted_by=new_submitted_by. The `NOT
+    claimed` guard is in the WHERE clause (not checked separately beforehand) so two
+    concurrent claims of the same listing can't both succeed. Returns None if the listing
+    does not exist OR is already claimed - the route disambiguates with a plain get_listing."""
+    with _connection() as conn:
+        return conn.execute(
+            f"UPDATE listings SET submitted_by = %(submitted_by)s, claimed = TRUE, updated_at = %(now)s "
+            f"WHERE id = %(id)s AND NOT claimed RETURNING {_READ}",
+            {"submitted_by": new_submitted_by, "now": now, "id": listing_id},
+        ).fetchone()
+
+
+def remove_imported_listing(listing_id: str, reason: str, now: datetime) -> dict[str, Any] | None:
+    """Hard-deletes an imported listing (source IS NOT NULL) and records it in
+    do_not_import (by source + endpoint_key) so a later sync never recreates it. Returns
+    the deleted row, or None if there is no such listing or it was never imported - the
+    route disambiguates with a plain get_listing."""
+    with _connection() as conn:
+        with conn.transaction():
+            row = conn.execute(
+                f"DELETE FROM listings WHERE id = %(id)s AND source IS NOT NULL RETURNING {_READ}",
+                {"id": listing_id},
+            ).fetchone()
+            if row is None:
+                return None
+            conn.execute(
+                "INSERT INTO do_not_import (source, endpoint_key, reason, created_at) VALUES (%s, %s, %s, %s) "
+                "ON CONFLICT (source, endpoint_key) DO UPDATE SET reason = EXCLUDED.reason, created_at = EXCLUDED.created_at",
+                (row["source"], normalize_endpoint_url(row["endpoint_url"]), reason, now),
+            )
+    return row
+
+
+def is_in_do_not_import(source: str, endpoint_url: str) -> bool:
+    endpoint_key = normalize_endpoint_url(endpoint_url)
+    with _connection() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM do_not_import WHERE source = %s AND endpoint_key = %s", (source, endpoint_key)
+        ).fetchone()
+    return row is not None
+
+
+#  Content columns a re-sync may refresh from source - but only while the listing is
+# still unclaimed. Once claimed, the owner may have edited any of these by hand (a
+# signed PATCH), and a later sync must not silently overwrite that; only the freshness
+# columns (last_synced_at, missing_from_source_since) always update regardless.
+# Never touched by a re-sync at all: id, source, endpoint_key/url's identity, submitted_by,
+# claimed, created_at, status, is_test and imported_at (status/is_test are operator- or
+# claim-owned; imported_at is "first imported", not "last imported").
+_IMPORT_REFRESHABLE_COLUMNS = (
+    "name", "description", "listing_type", "task_categories", "endpoint_url", "payment_wallet",
+    "pricing_model", "pricing_amount", "payment_options", "erc8004_identity", "verification_agent_id",
+    "source_url",
+)
+
+
+def import_upsert(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Insert a freshly-imported listing, or - if `row["source"]` + the normalized
+    endpoint_url already exist (listings_source_endpoint_uniq) - upsert it instead of
+    creating a duplicate. While the existing row is still unclaimed, a resync refreshes
+    its content (_IMPORT_REFRESHABLE_COLUMNS) from the latest `row`; once claimed, that
+    content is the owner's and a resync leaves it alone, only touching last_synced_at and
+    clearing missing_from_source_since. Returns (row, was_inserted). Caller must check
+    is_in_do_not_import first."""
+    row = {**row, "endpoint_key": normalize_endpoint_url(row["endpoint_url"])}
+    insert_columns = _WRITE_COLUMNS
+    placeholders = ", ".join(f"%({c})s" for c in insert_columns)
+    refresh_clause = ", ".join(
+        f"{c} = CASE WHEN listings.claimed THEN listings.{c} ELSE EXCLUDED.{c} END"
+        for c in _IMPORT_REFRESHABLE_COLUMNS
+    )
+    with _connection() as conn:
+        result = conn.execute(
+            f"INSERT INTO listings ({', '.join(insert_columns)}) VALUES ({placeholders}) "
+            f"ON CONFLICT (source, endpoint_key) WHERE source IS NOT NULL DO UPDATE SET "
+            f"{refresh_clause}, last_synced_at = EXCLUDED.last_synced_at, missing_from_source_since = NULL "
+            f"RETURNING {_READ}, (xmax = 0) AS _inserted",
+            _prepare(row),
+        ).fetchone()
+    inserted = result.pop("_inserted")
+    return result, inserted
+
+
+def preview_missing_from_source(source: str, seen_endpoint_urls: list[str]) -> list[dict[str, Any]]:
+    """Read-only preview of what mark_missing_from_source(source, seen_endpoint_urls, ...)
+    would mark - for a dry run, which must never write anything."""
+    seen_keys = [normalize_endpoint_url(u) for u in seen_endpoint_urls]
+    with _connection() as conn:
+        return conn.execute(
+            "SELECT id, name FROM listings WHERE source = %(source)s AND status = 'active' "
+            "AND missing_from_source_since IS NULL AND NOT (endpoint_key = ANY(%(seen)s))",
+            {"source": source, "seen": seen_keys},
+        ).fetchall()
+
+
+def mark_missing_from_source(source: str, seen_endpoint_urls: list[str], now: datetime) -> list[str]:
+    """For every ACTIVE listing from `source` not present in this sync (`seen_endpoint_urls`),
+    sets missing_from_source_since = now - but only the first time (rows already marked are
+    left alone, so re-running a sync doesn't keep bumping the timestamp). Returns the ids
+    newly marked. A listing that reappears in a later sync is un-marked by import_upsert."""
+    seen_keys = [normalize_endpoint_url(u) for u in seen_endpoint_urls]
+    with _connection() as conn:
+        rows = conn.execute(
+            "UPDATE listings SET missing_from_source_since = %(now)s "
+            "WHERE source = %(source)s AND status = 'active' AND missing_from_source_since IS NULL "
+            "AND NOT (endpoint_key = ANY(%(seen)s)) RETURNING id",
+            {"now": now, "source": source, "seen": seen_keys},
         ).fetchall()
     return [r["id"] for r in rows]

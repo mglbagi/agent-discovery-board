@@ -179,6 +179,25 @@ def test_a_legacy_table_gets_the_full_text_search_schema_and_can_be_searched(leg
     assert listing_id in [r["id"] for r in rows]
 
 
+def test_a_legacy_table_gets_the_imports_schema_and_existing_rows_are_claimed(legacy_table) -> None:
+    listing_id = _insert_legacy(legacy_table, "https://imports-migration.example.com/agent")
+    db.init_db()
+
+    columns = {r[0] for r in legacy_table.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'listings'"
+    ).fetchall()}
+    assert {"claimed", "source", "source_url", "imported_at", "last_synced_at", "missing_from_source_since"} <= columns
+    indexes = {r[0] for r in legacy_table.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'listings'").fetchall()}
+    assert "listings_source_endpoint_uniq" in indexes
+    assert legacy_table.execute("SELECT to_regclass('do_not_import')").fetchone()[0] == "do_not_import"
+
+    # A pre-existing (organic) row defaults to claimed, with no import metadata at all.
+    row = legacy_table.execute(
+        "SELECT claimed, source, source_url, imported_at, last_synced_at FROM listings WHERE id = %s", (listing_id,)
+    ).fetchone()
+    assert row == (True, None, None, None, None)
+
+
 def test_the_previous_versions_duplicate_index_is_replaced_by_the_scoped_one(legacy_table) -> None:
     legacy_table.execute("ALTER TABLE listings ADD COLUMN endpoint_key TEXT")
     legacy_table.execute(

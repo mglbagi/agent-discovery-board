@@ -460,6 +460,15 @@ written into it — required, no silent localhost fallback (see `.env.example`).
   listing's `endpoint_url` to that label. `verification_agent_id` (defaulting to
   `submitted_by`) makes the connection explicit rather than guessing from the URL.
 
+## Known limitations / backlog
+
+- **Claiming an imported listing only supports an EVM (eip155) `payment_wallet`.**
+  `POST /listings/{id}/claim` and `/remove-imported` are EIP-191 `personal_sign`
+  signatures (`app/core/wallet_auth.py`), verified with `eth_account`. An imported
+  listing whose pay-to address is Solana (ed25519) or an EVM smart-contract wallet
+  (ERC-1271) cannot currently be claimed or self-removed — there is no signature
+  scheme wired up for either yet. Not started.
+
 ## Independence from the verification service
 
 This is a **separate codebase, a separate database, and a separate deployment** from

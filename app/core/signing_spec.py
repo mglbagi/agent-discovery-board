@@ -72,6 +72,22 @@ def worked_example() -> dict[str, Any]:
     heartbeat_signature = _sign(heartbeat_message)
     heartbeat_header_json, heartbeat_header = _header(heartbeat_signature)
 
+    claim_message = _build_message(
+        action="claim-listing", listing_id=EXAMPLE_LISTING_ID, timestamp=EXAMPLE_TIMESTAMP, nonce=EXAMPLE_NONCE, body=None
+    )
+    claim_signature = _sign(claim_message)
+    claim_header_json, claim_header = _header(claim_signature)
+
+    remove_message = _build_message(
+        action="remove-imported-listing",
+        listing_id=EXAMPLE_LISTING_ID,
+        timestamp=EXAMPLE_TIMESTAMP,
+        nonce=EXAMPLE_NONCE,
+        body=None,
+    )
+    remove_signature = _sign(remove_message)
+    remove_header_json, remove_header = _header(remove_signature)
+
     return {
         "note": "EXAMPLE VALUES. The private key is public and controls nothing. In a real request use your own "
         "wallet, the real listing id, a timestamp within the allowed window of the server clock, and a fresh nonce.",
@@ -96,6 +112,24 @@ def worked_example() -> dict[str, Any]:
             "x_wallet_auth_json": heartbeat_header_json,
             "x_wallet_auth_header": heartbeat_header,
         },
+        "claim_listing": {
+            "note": "Unlike the actions above, the signer that must match is the listing's payment_wallet, "
+            "not submitted_by (which is an unsignable placeholder before a claim) - see app/core/imports.py.",
+            "request": {"method": "POST", "path": f"/listings/{EXAMPLE_LISTING_ID}/claim", "json_body": None},
+            "message": claim_message,
+            "signature": claim_signature,
+            "x_wallet_auth_json": claim_header_json,
+            "x_wallet_auth_header": claim_header,
+        },
+        "remove_imported_listing": {
+            "note": "Also verified against payment_wallet, not submitted_by - works whether or not the listing "
+            "has been claimed yet.",
+            "request": {"method": "POST", "path": f"/listings/{EXAMPLE_LISTING_ID}/remove-imported", "json_body": None},
+            "message": remove_message,
+            "signature": remove_signature,
+            "x_wallet_auth_json": remove_header_json,
+            "x_wallet_auth_header": remove_header,
+        },
     }
 
 
@@ -104,8 +138,10 @@ def signing_spec() -> dict[str, Any]:
         "scheme": "EIP-191 personal_sign (the 'Ethereum Signed Message' prefix; what eth_account "
         "encode_defunct / MetaMask personal_sign / ethers signMessage produce) over the plain-text message below. "
         "Not a transaction and not EIP-712 typed data.",
-        "signer": "The wallet in the listing's submitted_by (compared case-insensitively). Only an ordinary "
-        "key-based (EOA) wallet works: smart-contract wallet signatures (ERC-1271) cannot be verified.",
+        "signer": "The wallet in the listing's submitted_by (compared case-insensitively), EXCEPT for "
+        "claim-listing and remove-imported-listing, which are verified against payment_wallet instead (see "
+        "app/core/imports.py - submitted_by is an unsignable placeholder on an unclaimed listing). Only an "
+        "ordinary key-based (EOA) wallet works: smart-contract wallet signatures (ERC-1271) cannot be verified.",
         "header": {
             "name": "X-Wallet-Auth",
             "encoding": "base64 (standard alphabet, padded) of the UTF-8 JSON object "

@@ -21,6 +21,7 @@ from app.core import demo_data
 from app.core.activity import HEARTBEAT_MIN_INTERVAL, STALE_AFTER_DAYS
 from app.core.errors import SIGNATURE_HEADER_FIELD, error_codes_manifest
 from app.core.reserved import RESERVED_ADDRESSES
+from app.core.imports import DEFAULT_IMPORT_LISTING_TYPE
 from app.core.models import (
     ErrorResponse,
     HeartbeatResponse,
@@ -28,6 +29,7 @@ from app.core.models import (
     ListingResponse,
     ListingsPage,
     PaymentOption,
+    RemovalResponse,
 )
 from app.core.signing_spec import signing_spec
 from app.mcp_server import MCP_PATH
@@ -100,6 +102,7 @@ def _build_listings_extension() -> dict[str, Any]:
                         "cursor (preferred)",
                         "offset (legacy)",
                         "include_test",
+                        "claimed",
                     ],
                 },
                 "get": {"method": "GET", "url": f"{LISTINGS_URL}/{{id}}", "auth": "none"},
@@ -112,6 +115,21 @@ def _build_listings_extension() -> dict[str, Any]:
                     "action": "heartbeat-listing",
                     "limit": f"at most once per {int(HEARTBEAT_MIN_INTERVAL.total_seconds() // 3600)} hours per "
                     "listing; a repeat gets 429 rate_limited with retry_after",
+                },
+                "claim": {
+                    "method": "POST",
+                    "url": f"{LISTINGS_URL}/{{id}}/claim",
+                    "auth": "wallet-signature (payment_wallet, not submitted_by)",
+                    "action": "claim-listing",
+                    "description": "Claim an unclaimed imported listing; see params.imports.",
+                },
+                "removeImported": {
+                    "method": "POST",
+                    "url": f"{LISTINGS_URL}/{{id}}/remove-imported",
+                    "auth": "wallet-signature (payment_wallet, not submitted_by)",
+                    "action": "remove-imported-listing",
+                    "description": "Hard-delete an imported listing and block it from being re-imported; see "
+                    "params.imports.",
                 },
             },
             "duplicateDetection": {
@@ -176,10 +194,40 @@ def _build_listings_extension() -> dict[str, Any]:
                 "suggestedEndpointUrls": "https://test-<id>.example.invalid/... (the .invalid TLD can never resolve)",
             },
             "reservedAddresses": {
-                "description": "These addresses are refused as submitted_by (422 reserved_address) because their "
-                "private keys are public - anyone could sign for a listing they owned. The signing spec's worked "
-                "example uses the first one for exactly that reason.",
+                "description": "These addresses are refused as submitted_by (422 reserved_address), for one of "
+                "two reasons: either the private key is publicly known (anyone could sign for a listing they "
+                "owned - the signing spec's worked example uses this one for exactly that reason), or no "
+                "private key can ever sign for it at all (used internally as the placeholder submitted_by for "
+                "an unclaimed import - see params.imports; a human would just lock themselves out).",
                 "addresses": list(RESERVED_ADDRESSES),
+            },
+            "imports": {
+                "description": "A listing can be imported from a third-party directory instead of submitted "
+                "directly. It starts unclaimed (claimed: false), carrying source and source_url, with "
+                "submitted_by set to a placeholder no one can sign for - so the normal signed PATCH/DELETE/"
+                "heartbeat do not work on it until it is claimed. It is otherwise a normal listing: browsable, "
+                "searchable, filterable by claimed.",
+                "defaultListingType": DEFAULT_IMPORT_LISTING_TYPE,
+                "claim": {
+                    "description": "The real owner (whoever controls payment_wallet) claims it by signing "
+                    "POST /listings/{id}/claim (action claim-listing, no body, verified against payment_wallet "
+                    "- see signingSpec). On success submitted_by becomes that address and claimed becomes true; "
+                    "from then on it behaves exactly like any other listing, and a re-sync never overwrites its "
+                    "content again. 409 already_claimed if it already has an owner.",
+                },
+                "removal": {
+                    "description": "The same pay-to owner can instead sign POST /listings/{id}/remove-imported "
+                    "(action remove-imported-listing, no body, verified against payment_wallet) to have it "
+                    "removed immediately, claimed or not. The listing is hard-deleted and its (source, "
+                    "endpoint_url) is recorded so a later sync will never recreate it. 422 not_imported if the "
+                    "listing's source is not set.",
+                    "responseSchema": RemovalResponse.model_json_schema(),
+                },
+                "staleness": "an imported listing a sync no longer finds at its source is marked stale "
+                "immediately (missing_from_source_since), rather than waiting out the normal activity "
+                "threshold; it un-marks itself if a later sync finds it again.",
+                "contentPreservedAfterClaim": "once claimed, a re-sync only refreshes last_synced_at and never "
+                "overwrites the listing's content, name, pricing or anything else the owner may have edited.",
             },
             "deprecatedFields": {"payment_wallet": "Use payment_options. Still required and still returned."},
             "errors": {

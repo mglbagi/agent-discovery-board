@@ -365,6 +365,23 @@ class ListingResponse(BaseModel):
         "while badge lookups are unconfigured, which is this service's shipped default. Never "
         "required, never blocks any operation on this listing.",
     )
+    claimed: bool = Field(
+        default=True,
+        description="False for an imported listing nobody has proven control of yet (see source). Always true "
+        "for a listing submitted directly through POST /listings. POST /listings/{id}/claim flips this to "
+        "true, signed by the wallet matching payment_wallet.",
+    )
+    source: str | None = Field(
+        default=None, description="Where this listing was imported from, e.g. 'x402_bazaar'. Null if it was "
+        "submitted directly through POST /listings, not imported."
+    )
+    source_url: str | None = Field(
+        default=None, description="The specific page/record at `source` this listing was imported from."
+    )
+    imported_at: datetime | None = Field(default=None, description="When this listing was first imported. Null if not imported.")
+    last_synced_at: datetime | None = Field(
+        default=None, description="When an import last re-synced this listing's content from source. Null if not imported."
+    )
 
 
 class ListingsPage(BaseModel):
@@ -375,6 +392,15 @@ class ListingsPage(BaseModel):
     next_cursor: str | None = Field(
         default=None,
         description="Pass as ?cursor= (or the cursor tool argument) to get the next page; null on the last page.",
+    )
+
+
+class RemovalResponse(BaseModel):
+    id: str
+    removed: bool = Field(description="Always true on success: the listing was hard-deleted.")
+    do_not_import: bool = Field(
+        default=True,
+        description="Always true: its (source, endpoint) is now recorded so a future sync will not recreate it.",
     )
 
 

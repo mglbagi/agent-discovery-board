@@ -37,4 +37,8 @@ def last_activity_at(row: dict[str, Any]) -> datetime:
 
 def is_stale(row: dict[str, Any], now: datetime | None = None) -> bool:
     now = now or datetime.now(timezone.utc)
+    if row.get("missing_from_source_since") is not None:
+        # An imported listing a sync no longer finds at its source: stale immediately,
+        # rather than waiting out the normal activity threshold (app/core/imports.py).
+        return True
     return now - last_activity_at(row) > timedelta(days=STALE_AFTER_DAYS)

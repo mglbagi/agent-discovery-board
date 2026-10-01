@@ -72,6 +72,12 @@ SIGNED_ACTIONS: dict[str, dict[str, Any]] = {
     "update-listing": {"method": "PATCH", "path": "/listings/{id}", "signs_body_hash": True},
     "delete-listing": {"method": "DELETE", "path": "/listings/{id}", "signs_body_hash": False},
     "heartbeat-listing": {"method": "POST", "path": "/listings/{id}/heartbeat", "signs_body_hash": False},
+    # Unlike the three actions above, these are verified against the listing's
+    # payment_wallet, not its submitted_by - see app/core/imports.py. Before a claim,
+    # submitted_by is an unsignable placeholder (app/core/reserved.py), so there is no
+    # other way for the real pay-to owner to prove control.
+    "claim-listing": {"method": "POST", "path": "/listings/{id}/claim", "signs_body_hash": False},
+    "remove-imported-listing": {"method": "POST", "path": "/listings/{id}/remove-imported", "signs_body_hash": False},
 }
 _MAX_TRACKED_NONCES = 50_000
 _HEADER_NAME = "x-wallet-auth"
@@ -147,10 +153,19 @@ def _parse_header(request: Request) -> tuple[str, int, str]:
 
 
 def verify_wallet_auth(
-    request: Request, *, action: str, listing_id: str, submitted_by: str, body: dict[str, Any] | None
+    request: Request,
+    *,
+    action: str,
+    listing_id: str,
+    submitted_by: str,
+    body: dict[str, Any] | None,
+    expected_role: str = "submitted_by",
 ) -> None:
     """Raises ApiError (an HTTPException: 401, or 403 for wrong_signer) on any failure;
-    returns None (does nothing) on success."""
+    returns None (does nothing) on success. `submitted_by` is the address the recovered
+    signer must match - despite the name, claim-listing and remove-imported-listing pass
+    the listing's payment_wallet here instead (see app/core/imports.py), which is what
+    `expected_role` is for: it only changes the wrong_signer error's wording."""
     signature, timestamp, nonce = _parse_header(request)
 
     now = int(time.time())
@@ -181,5 +196,5 @@ def verify_wallet_auth(
         raise ApiError(
             403,
             "wrong_signer",
-            "Signature is valid but was not made by this listing's submitted_by address.",
+            f"Signature is valid but was not made by this listing's {expected_role} address.",
         )

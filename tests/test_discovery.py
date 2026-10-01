@@ -29,6 +29,7 @@ def test_agent_card_lists_known_listing_types_and_task_categories() -> None:
         "request",
         "announcement",
         "notice",
+        "verification_profile",
     }
     assert "data extraction" in extension["params"]["taskCategories"]
 

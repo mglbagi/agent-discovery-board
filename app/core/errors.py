@@ -65,10 +65,17 @@ ERROR_CODES: dict[str, ErrorSpec] = {
     "reserved_address": ErrorSpec(
         422,
         False,
-        "submitted_by is a publicly known example address whose private key is public, so anyone could sign "
-        "for it. Use a wallet you control.",
+        "submitted_by cannot be this address: either its private key is publicly known (anyone could sign for "
+        "it) or no private key can ever sign for it (you would lock yourself out). Use a wallet you control.",
     ),
     "listing_inactive": ErrorSpec(409, False, "The listing is inactive; reactivate it with PATCH status=active first."),
+    "already_claimed": ErrorSpec(409, False, "This listing has already been claimed; it cannot be claimed again."),
+    "not_imported": ErrorSpec(
+        422,
+        False,
+        "This listing was not imported from a third-party source (its source is not set), so the pay-to-address "
+        "removal flow does not apply to it; use the normal signed DELETE instead.",
+    ),
     "body_too_large": ErrorSpec(413, False, "The request body exceeds the maximum allowed size."),
     "validation_error": ErrorSpec(422, False, "A field is missing, malformed or out of range; see detail."),
     "invalid_task_category": ErrorSpec(422, False, "A task_category value is not in the fixed list."),
@@ -164,7 +171,7 @@ def _is_signed_request(method: str, path: str) -> bool:
     if parts[:1] != ["listings"]:
         return False
     return (len(parts) == 2 and method in ("PATCH", "DELETE")) or (
-        len(parts) == 3 and parts[2] == "heartbeat" and method == "POST"
+        len(parts) == 3 and parts[2] in ("heartbeat", "claim", "remove-imported") and method == "POST"
     )
 
 
@@ -226,6 +233,20 @@ def next_actions_for(code: str, *, method: str, path: str, extras: dict[str, Any
                 'Reactivate the listing by PATCHing {"status": "active"}, then retry.',
             )
         ]
+    if code == "already_claimed":
+        base = path.removesuffix("/claim")
+        return [action("GET", base, [], "Inspect the listing: it already has an owner in submitted_by.")]
+    if code == "not_imported":
+        base = path.removesuffix("/remove-imported")
+        return [
+            action(
+                "DELETE",
+                base,
+                [SIGNATURE_HEADER_FIELD],
+                "This listing was not imported; deactivate it with the normal signed DELETE instead (signed by "
+                "its submitted_by).",
+            )
+        ]
     if code == "rate_limited":
         wait = extras.get("retry_after")
         when = f"after {wait} seconds" if wait is not None else "after the Retry-After delay"
@@ -252,8 +273,10 @@ def next_actions_for(code: str, *, method: str, path: str, extras: dict[str, Any
             _manifest_action(),
         ]
     if code == "wrong_signer":
+        base = path.removesuffix("/heartbeat").removesuffix("/claim").removesuffix("/remove-imported")
+        expected = "payment_wallet" if path.endswith(("/claim", "/remove-imported")) else "submitted_by"
         return [
-            action("GET", path.removesuffix("/heartbeat"), [], "Read the listing's submitted_by; only that wallet can sign for it."),
+            action("GET", base, [], f"Read the listing's {expected}; only that wallet can sign for it."),
             _manifest_action(),
         ]
     if code == "invalid_cursor":

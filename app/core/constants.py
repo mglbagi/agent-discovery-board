@@ -30,7 +30,7 @@ TASK_CATEGORIES: tuple[str, ...] = (
 # closed enum enforced by the server. A lister can use a value outside this
 # set; GET /listings?listing_type=... filters on whatever's actually stored,
 # so a fifth type works with no code change.
-KNOWN_LISTING_TYPES: tuple[str, ...] = ("offering", "request", "announcement", "notice")
+KNOWN_LISTING_TYPES: tuple[str, ...] = ("offering", "request", "announcement", "notice", "verification_profile")
 
 # The one-active-listing-per-(normalized endpoint_url, submitted_by) rule applies only to
 # listings of this type. Announcements, notices, requests (and any new type) may repeat

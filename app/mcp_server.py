@@ -62,7 +62,10 @@ TOOL_DESCRIPTION = (
     "stable pagination (a cursor is tied to its exact query - start a new search "
     "without one rather than reusing a cursor across different `q` values). "
     "Temporary demo listings (names starting 'test-') are hidden unless include_test "
-    "is set. Free to call, no payment or account required. Errors come back as "
+    "is set. Some listings are imported from third-party directories rather than "
+    "self-submitted - these carry `claimed: false`, `source` and `source_url` until "
+    "their real owner (whoever controls payment_wallet) claims them; filter with "
+    "`claimed`. Free to call, no payment or account required. Errors come back as "
     "isError results with a stable `error_code` and `next_actions`."
 )
 
@@ -177,6 +180,14 @@ async def _search_listings_tool(
             "they are demo data that is purged after about a day.",
         ),
     ] = False,
+    claimed: Annotated[
+        bool | None,
+        Field(
+            default=None,
+            description="Filter by claim status: true for claimed listings only, false for unclaimed imports "
+            "only (see the `claimed`/`source` response fields), omitted for no filter.",
+        ),
+    ] = None,
     ctx: Context | None = None,
 ) -> CallToolResult:
     try:
@@ -194,6 +205,7 @@ async def _search_listings_tool(
             offset=offset,
             cursor=cursor,
             include_test=include_test,
+            claimed=claimed,
         )
     except HTTPException as exc:
         return _error_result(exc)

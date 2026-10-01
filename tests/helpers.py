@@ -83,6 +83,30 @@ def db_row(listing_id: str) -> dict:
     return db.get_listing(listing_id)
 
 
+def import_listing(source: str, payment_wallet: str, **overrides) -> dict:
+    """An unclaimed imported listing, written the same way scripts/bulk_import_listings.py
+    would (via app.core.imports.build_import_row + db.import_upsert) - never through
+    POST /listings, which has no way to create one."""
+    from datetime import datetime, timezone
+
+    from app.core import db
+    from app.core.imports import build_import_row
+
+    record = {
+        "name": f"Imported {uuid.uuid4().hex[:8]}",
+        "description": "An imported listing used in tests.",
+        "task_categories": ["other"],
+        "endpoint_url": f"https://example.com/imported/{uuid.uuid4().hex}",
+        "payment_wallet": payment_wallet,
+        "pricing_model": "per_call",
+        "pricing_amount": "$0.01",
+        **overrides,
+    }
+    row = build_import_row(record, source=source, now=datetime.now(timezone.utc))
+    created, _ = db.import_upsert(row)
+    return created
+
+
 def assert_error(response, status: int, code: str) -> dict:
     """Every error, from anywhere, has the same machine-readable shape."""
     body = response.json()
