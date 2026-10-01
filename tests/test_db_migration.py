@@ -155,6 +155,30 @@ def test_existing_rows_migrate_as_real_even_when_named_test(legacy_table) -> Non
     assert db.get_listing(listing_id)["name"] == "test-runner service"
 
 
+def test_a_legacy_table_gets_the_full_text_search_schema_and_can_be_searched(legacy_table) -> None:
+    listing_id = _insert_legacy(legacy_table, "https://fts-migration.example.com/agent", name="Searchable Legacy")
+    db.init_db()
+
+    columns = {r[0] for r in legacy_table.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'listings'"
+    ).fetchall()}
+    assert {"search_vector", "trigram_text"} <= columns
+    indexes = {r[0] for r in legacy_table.execute("SELECT indexname FROM pg_indexes WHERE tablename = 'listings'").fetchall()}
+    assert {"listings_search_vector_gin_idx", "listings_trigram_gin_idx"} <= indexes
+    assert legacy_table.execute(
+        "SELECT to_regclass('search_log')"
+    ).fetchone()[0] == "search_log"
+
+    # The backfill covers this pre-existing row (the trigger only fires on future writes).
+    row = legacy_table.execute("SELECT search_vector IS NOT NULL AS has_vector FROM listings WHERE id = %s", (listing_id,)).fetchone()
+    assert row[0] is True
+
+    rows, total, has_more, mode = db.list_listings(
+        listing_type=None, task_categories=None, q="searchable legacy", status=None, limit=10, offset=0,
+    )
+    assert listing_id in [r["id"] for r in rows]
+
+
 def test_the_previous_versions_duplicate_index_is_replaced_by_the_scoped_one(legacy_table) -> None:
     legacy_table.execute("ALTER TABLE listings ADD COLUMN endpoint_key TEXT")
     legacy_table.execute(

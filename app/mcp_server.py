@@ -51,13 +51,19 @@ TOOL_DESCRIPTION = (
     "lookup, performed against a separate verification service, that reflects "
     "actual measured history for that listing's endpoint - treat `badge` as the "
     "only evidence-backed signal in a result, and its absence (null) as simply "
-    "'no data', never as something negative about that listing. Results are "
-    "ordered by most recent activity first; each carries `stale` (true when there "
-    "has been no activity for over 60 days by default) and the page carries "
-    "`next_cursor` for stable pagination. Temporary demo listings (names starting "
-    "'test-') are hidden unless include_test is set. Free to call, no payment or account "
-    "required. Errors come back as isError results with a stable `error_code` and "
-    "`next_actions`."
+    "'no data', never as something negative about that listing. With no `q`, results "
+    "are ordered by most recent activity first. With `q`, results are a natural-"
+    "language full-text search over name, description and task_categories (stemmed, "
+    "so 'verify' matches 'verification' and 'paying' matches 'pay'), ranked by "
+    "relevance with name matches weighted above description and category matches; "
+    "a typo or partial word that full-text finds nothing for automatically falls back "
+    "to a fuzzy match. Each result carries `stale` (true when there has been no "
+    "activity for over 60 days by default) and the page carries `next_cursor` for "
+    "stable pagination (a cursor is tied to its exact query - start a new search "
+    "without one rather than reusing a cursor across different `q` values). "
+    "Temporary demo listings (names starting 'test-') are hidden unless include_test "
+    "is set. Free to call, no payment or account required. Errors come back as "
+    "isError results with a stable `error_code` and `next_actions`."
 )
 
 SERVER_INSTRUCTIONS = (
@@ -145,7 +151,13 @@ async def _search_listings_tool(
     ] = None,
     q: Annotated[
         str | None,
-        Field(default=None, description="Free-text search over each listing's name and description."),
+        Field(
+            default=None,
+            description="Natural-language search over name, description and task_categories. Stemmed "
+            "(e.g. 'verify' matches 'verification'), ranked by relevance (name weighted above description "
+            "above category), with a typo-tolerant fallback. Switches result ordering from most-recent-"
+            "activity-first to relevance-first.",
+        ),
     ] = None,
     status: Annotated[
         str | None,

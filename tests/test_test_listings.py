@@ -87,8 +87,12 @@ def test_test_listings_are_hidden_from_default_browse_and_search() -> None:
     real = _make("real-" + uuid.uuid4().hex[:8])
     default = client.get("/listings", params={"limit": 100})
     assert test_listing["id"] not in _ids(default) and real["id"] in _ids(default)
-    by_text = client.get("/listings", params={"q": test_listing["name"]}).json()
-    assert by_text["total"] == 0 and by_text["listings"] == []
+    # Not total == 0: the trigram fallback is a genuine fuzzy match over the whole table
+    # (unlike the old ILIKE exact-substring check), so an unrelated listing can legitimately
+    # score above the similarity threshold against this name by coincidence. What this test
+    # actually guarantees is that the test listing itself never shows up unless asked for.
+    by_text = client.get("/listings", params={"q": test_listing["name"]})
+    assert test_listing["id"] not in _ids(by_text)
 
 
 def test_include_test_reveals_them_and_the_total_agrees() -> None:

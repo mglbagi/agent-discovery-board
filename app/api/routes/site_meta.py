@@ -29,7 +29,10 @@ Everything here is structured JSON with stable codes, for agents. Free: no payme
 ## Read (no auth)
 
 - GET {SERVICE_BASE_URL}/listings - browse/search. Query: listing_type, task_category (repeatable), q, status, limit, cursor. \
-Newest last activity first; pass next_cursor back as cursor for the next page.
+No q: newest last activity first. With q: natural-language full-text search (stemmed, e.g. "verify" matches \
+"verification") over name/description/task_categories, ranked by relevance (name above description above \
+category), with a typo-tolerant fallback when full-text finds nothing. Pass next_cursor back as cursor for the \
+next page; a cursor is bound to its exact q.
 - GET {SERVICE_BASE_URL}/listings/{{id}} - one listing.
 - MCP: POST {SERVICE_BASE_URL}/mcp, tool search_listings (same search, same results).
 - Each listing has last_activity_at and stale (true after {STALE_AFTER_DAYS:g} days without activity).

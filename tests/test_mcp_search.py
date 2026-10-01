@@ -203,14 +203,19 @@ async def test_search_listings_tool_is_rate_limited(live_server) -> None:
 
 
 async def test_results_carry_freshness_fields_and_are_newest_activity_first(live_server) -> None:
-    marker = "mcp-fresh-" + Account.create().address[-8:]
-    old = await _create_via_rest(live_server, name=f"Old {marker}")
-    new = await _create_via_rest(live_server, name=f"New {marker}")
+    # listing_type (not q) is the isolation key: this test is about plain-browse
+    # activity ordering, which free-text search intentionally replaces with relevance
+    # ranking (see test_search.py) - so it must stay off the ranked-search path.
+    # Lowercased: listing_type is normalized to lowercase on write (app/core/models.py)
+    # but matched case-sensitively on read, and an address's hex suffix can be mixed case.
+    marker = ("mcp-fresh-" + Account.create().address[-8:]).lower()
+    old = await _create_via_rest(live_server, marker, name=f"Old {marker}")
+    new = await _create_via_rest(live_server, marker, name=f"New {marker}")
     from tests.helpers import set_listing_times
 
     set_listing_times(old["id"], created_days_ago=90, updated_days_ago=90, last_seen_hours_ago=None)
 
-    body = _body(await _call_tool(live_server, "search_listings", {"q": marker}))
+    body = _body(await _call_tool(live_server, "search_listings", {"listing_type": marker}))
     assert [i["id"] for i in body["listings"]] == [new["id"], old["id"]]
     by_id = {i["id"]: i for i in body["listings"]}
     assert by_id[old["id"]]["stale"] is True and by_id[new["id"]]["stale"] is False
@@ -246,7 +251,13 @@ async def test_a_bad_cursor_via_mcp_is_a_coded_error(live_server) -> None:
 
 
 async def test_test_listings_are_hidden_from_the_tool_unless_include_test(live_server) -> None:
-    marker = "mcp-tl-" + Account.create().address[-8:]
+    # No hyphen in the marker itself: websearch_to_tsquery treats a hyphenated query term
+    # as an adjacency phrase (the compound token followed by each part), and gluing "test-"
+    # directly onto a hyphenated marker changes which compound token the document has at
+    # that position - "test-mcp-tl-x" and "real mcp-tl-x" would then no longer match the
+    # same phrase even though both plainly contain "mcp-tl-x". A plain alnum marker makes
+    # the query a single lexeme instead, matching either listing's text equally.
+    marker = "mcptl" + Account.create().address[-8:]
     test_listing = await _create_via_rest(live_server, name=f"test-{marker}")
     real = await _create_via_rest(live_server, name=f"real {marker}")
 

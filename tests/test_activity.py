@@ -10,7 +10,7 @@ from eth_account import Account
 from fastapi.testclient import TestClient
 
 from app.core import activity, db
-from app.core.pagination import decode_cursor, encode_cursor
+from app.core.pagination import ActivityCursor, decode_cursor, encode_activity_cursor
 from app.main import app
 from tests.helpers import assert_error, listing_payload, set_listing_times, wallet_auth_header
 
@@ -18,17 +18,22 @@ client = TestClient(app)
 
 
 def _make(marker: str, n: int = 1, owner=None) -> list[dict]:
+    # listing_type (not q) is the isolation key here: these tests are about activity
+    # ordering and cursor pagination, not free-text search, so they must stay on the
+    # plain activity-ordered path rather than triggering ranked search - listing_type is
+    # an open, unvalidated slug (see app/core/models.py), so a unique marker works as a
+    # listing_type exactly as well as it used to work as a `name`-matching q.
     owner = owner or Account.create()
     out = []
     for i in range(n):
-        response = client.post("/listings", json=listing_payload("offering", owner.address, name=f"{marker} #{i}"))
+        response = client.post("/listings", json=listing_payload(marker, owner.address, name=f"{marker} #{i}"))
         assert response.status_code == 201, response.text
         out.append(response.json())
     return out
 
 
 def _search(marker: str, **params) -> dict:
-    response = client.get("/listings", params={"q": marker, **params})
+    response = client.get("/listings", params={"listing_type": marker, **params})
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -183,8 +188,8 @@ def test_an_oversized_cursor_is_rejected() -> None:
 
 def test_cursor_round_trip_and_timezone_requirement() -> None:
     when = datetime(2026, 5, 1, 12, 30, 45, 123456, tzinfo=timezone.utc)
-    assert decode_cursor(encode_cursor(when, "abc")) == (when, "abc")
-    naive = encode_cursor(datetime(2026, 5, 1), "abc")
+    assert decode_cursor(encode_activity_cursor(when, "abc")) == ActivityCursor(activity=when, id="abc")
+    naive = encode_activity_cursor(datetime(2026, 5, 1), "abc")
     with pytest.raises(Exception):
         decode_cursor(naive)
 

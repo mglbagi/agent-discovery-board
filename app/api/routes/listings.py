@@ -37,7 +37,12 @@ from app.core.models import (
     Status,
     check_pricing_consistency,
 )
-from app.core.pagination import decode_cursor, encode_cursor
+from app.core.pagination import (
+    encode_activity_cursor,
+    encode_rank_cursor,
+    encode_similarity_cursor,
+    resolve_cursor,
+)
 from app.core.rate_limit import rate_limit_listing_creation, rate_limit_listing_mutation
 from app.core.reserved import is_reserved_address
 from app.core.wallet_auth import verify_wallet_auth
@@ -126,9 +131,12 @@ async def search_listings(
     badges. Both `GET /listings` below and the `search_listings` MCP tool
     (app/mcp_server.py) call this exact function - neither reimplements any of it.
 
-    Results are ordered newest last activity first (the latest of created_at,
-    updated_at, last_seen_at), id as tiebreaker; `cursor` resumes strictly after the
-    last item of the previous page.
+    With no `q`: ordered newest last activity first (the latest of created_at, updated_at,
+    last_seen_at), id as tiebreaker. With `q`: a natural-language full-text search (see
+    app/core/db.py's list_listings) ranked by relevance instead, falling back to a
+    typo-tolerant trigram match when full-text finds nothing. Either way, `cursor` resumes
+    strictly after the last item of the previous page, and is bound to the exact `q` (if
+    any) it was minted for.
 
     FastAPI's `Query(...)` constraints on the REST route already reject most bad
     input before it gets here, but the MCP tool has no equivalent of that, so the
@@ -154,8 +162,8 @@ async def search_listings(
         raise ApiError(422, "invalid_cursor", "cursor is not a valid cursor returned by this service.")
 
     categories = _validate_task_category_filter(task_category)
-    decoded = decode_cursor(cursor) if cursor is not None else None
-    rows, total, has_more = await asyncio.to_thread(
+    decoded = resolve_cursor(cursor, q)
+    rows, total, has_more, mode = await asyncio.to_thread(
         db.list_listings,
         listing_type=listing_type,
         task_categories=categories,
@@ -166,8 +174,20 @@ async def search_listings(
         cursor=decoded,
         include_test=include_test,
     )
+
+    next_cursor = None
+    if rows and has_more:
+        last = rows[-1]
+        if mode == "rank":
+            next_cursor = encode_rank_cursor(last["_cursor_value"], last["id"], q)
+        elif mode == "similarity":
+            next_cursor = encode_similarity_cursor(last["_cursor_value"], last["id"], q)
+        else:
+            next_cursor = encode_activity_cursor(last_activity_at(last), last["id"])
+    for row in rows:
+        row.pop("_cursor_value", None)
+
     listings = await asyncio.gather(*(_to_response(row) for row in rows))
-    next_cursor = encode_cursor(last_activity_at(rows[-1]), rows[-1]["id"]) if rows and has_more else None
     return ListingsPage(listings=list(listings), total=total, limit=limit, offset=offset, next_cursor=next_cursor)
 
 
@@ -235,14 +255,20 @@ async def create_listing(payload: ListingCreate) -> ListingResponse:
 async def browse_listings(
     listing_type: str | None = Query(default=None, max_length=MAX_LISTING_TYPE_FILTER_LENGTH),
     task_category: list[str] | None = Query(default=None, alias="task_category"),
-    q: str | None = Query(default=None, max_length=MAX_SEARCH_Q_LENGTH),
+    q: str | None = Query(
+        default=None,
+        max_length=MAX_SEARCH_Q_LENGTH,
+        description="Natural-language search over name, description and task_categories (stemmed, typo-"
+        "tolerant fallback). Switches ordering from newest-activity-first to relevance.",
+    ),
     status: Status | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=MAX_SEARCH_LIMIT),
     offset: int = Query(default=0, ge=0, description="Legacy; prefer cursor."),
     cursor: str | None = Query(
         default=None,
         max_length=MAX_CURSOR_LENGTH,
-        description="next_cursor from the previous page. Order: newest last activity first.",
+        description="next_cursor from the previous page. Order: newest last activity first, or relevance when "
+        "q is set. Bound to the exact q (if any) it was minted for.",
     ),
     include_test: bool = Query(
         default=False,

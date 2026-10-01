@@ -125,14 +125,26 @@ def _build_listings_extension() -> dict[str, Any]:
                 "slashes removed; duplicate slashes collapsed; query parameters sorted",
             },
             "freshness": {
-                "defaultSort": "last_activity_at descending (id descending as tiebreaker), where last_activity_at "
-                "is the latest of created_at, updated_at and last_seen_at",
+                "defaultSort": "without q: last_activity_at descending (id descending as tiebreaker), where "
+                "last_activity_at is the latest of created_at, updated_at and last_seen_at. With q: relevance "
+                "(see search.ranking below), not activity.",
                 "pagination": "opaque keyset cursor: pass next_cursor from a page as ?cursor= (or the cursor tool "
                 "argument) for the next page. Stable when listings are added meanwhile. offset is legacy and "
-                "cannot be combined with cursor.",
+                "cannot be combined with cursor. A search cursor is bound to its exact q - reusing it with a "
+                "different q, or switching between a plain browse and a search, is rejected (invalid_cursor); "
+                "start over without a cursor instead.",
                 "stale": f"true when last_activity_at is older than {STALE_AFTER_DAYS:g} days (configurable, "
                 "STALE_AFTER_DAYS). Computed from stored data only; the board never calls a listing's endpoint.",
                 "heartbeat": "the owner's signed POST /listings/{id}/heartbeat sets last_seen_at",
+            },
+            "search": {
+                "description": "q is natural-language full-text search (Postgres websearch_to_tsquery) over "
+                "name, description and task_categories, with stemming (e.g. 'verify' matches 'verification', "
+                "'paying' matches 'pay') and stopword/punctuation handling.",
+                "ranking": "by relevance (ts_rank): name matches are weighted above description matches, which "
+                "are weighted above task_categories matches.",
+                "fallback": "a typo or partial word that full-text matches nothing for automatically falls back "
+                "to a fuzzy (trigram) match against name and description.",
             },
             "paymentOptions": {
                 "description": "Optional structured payment methods on a listing, one per network/asset. Preferred "

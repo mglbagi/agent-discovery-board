@@ -9,10 +9,11 @@ statements disabled (unsafe through Neon's PgBouncer "-pooler" endpoints), and
 the schema created once at startup rather than per request.
 """
 
+import logging
 import os
 import threading
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Iterator
 
 import psycopg
@@ -23,6 +24,9 @@ from psycopg_pool import ConnectionPool
 from app.core.activity import ACTIVITY_SQL
 from app.core.constants import DUPLICATE_GUARDED_LISTING_TYPE
 from app.core.endpoint import normalize_endpoint_url
+from app.core.pagination import AnyCursor
+
+logger = logging.getLogger("app.db")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
@@ -42,6 +46,22 @@ _state_lock = threading.Lock()
 # Raised by create/update when the partial unique index (one ACTIVE offering per
 # normalized endpoint_url + submitter) rejects a write; the route maps it to 409.
 UniqueViolation = psycopg.errors.UniqueViolation
+
+# Below this many full-text hits, try the pg_trgm similarity fallback instead (typo/
+# partial-word tolerance) - see list_listings. Only reached when full-text found
+# nothing at all, so this is "zero" in practice, kept as a threshold rather than a
+# literal 0 check in case that's ever worth loosening.
+FULLTEXT_FALLBACK_THRESHOLD = 0
+# word_similarity() scores (see list_listings): empirically, real typos ("verfy" for
+# "verify", "recipt" for "receipt") against a realistic listing description score
+# ~0.5; unrelated/noise queries score under 0.15. 0.3 sits well inside that gap.
+TRIGRAM_SIMILARITY_THRESHOLD = 0.3
+
+# Set during _ensure_schema(): whether pg_trgm (and its GIN index on listings) are
+# actually usable on this database. Best-effort, not a required dependency - if an
+# environment can't install the extension, full-text search still works fully; only
+# the typo-tolerant fallback is unavailable. See _ensure_schema().
+_trigram_available = False
 
 
 def _get_pool() -> ConnectionPool:
@@ -67,8 +87,15 @@ def _get_pool() -> ConnectionPool:
     return _pool
 
 
+_SEARCH_VECTOR_EXPR = (
+    "setweight(to_tsvector('english', coalesce({name}, '')), 'A') || "
+    "setweight(to_tsvector('english', coalesce({description}, '')), 'B') || "
+    "setweight(to_tsvector('english', array_to_string(coalesce({task_categories}, ARRAY[]::text[]), ' ')), 'C')"
+)
+
+
 def _ensure_schema() -> None:
-    global _schema_ready
+    global _schema_ready, _trigram_available
     if _schema_ready:
         return
     with _state_lock:
@@ -140,6 +167,70 @@ def _ensure_schema() -> None:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS listings_test_created_idx ON listings (created_at) WHERE is_test"
             )
+
+            # --- Full-text search (app/core/db.py's list_listings) -------------------------
+            # search_vector can't be a GENERATED column itself: Postgres's array-to-text
+            # functions/casts (needed to fold task_categories in) aren't IMMUTABLE on this
+            # version, which GENERATED STORED requires - confirmed empirically, not just
+            # read from docs. A BEFORE INSERT/UPDATE trigger has no such restriction and
+            # keeps it exactly as current as a generated column would.
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS search_vector tsvector")
+            # trigram_text has no arrays in it, so it CAN be a plain generated column.
+            conn.execute(
+                "ALTER TABLE listings ADD COLUMN IF NOT EXISTS trigram_text text "
+                "GENERATED ALWAYS AS (coalesce(name, '') || ' ' || coalesce(description, '')) STORED"
+            )
+            conn.execute(
+                f"""
+                CREATE OR REPLACE FUNCTION listings_search_vector_update() RETURNS trigger AS $$
+                BEGIN
+                    NEW.search_vector := {_SEARCH_VECTOR_EXPR.format(
+                        name="NEW.name", description="NEW.description", task_categories="NEW.task_categories"
+                    )};
+                    RETURN NEW;
+                END
+                $$ LANGUAGE plpgsql
+                """
+            )
+            conn.execute("DROP TRIGGER IF EXISTS listings_search_vector_trg ON listings")
+            conn.execute(
+                "CREATE TRIGGER listings_search_vector_trg BEFORE INSERT OR UPDATE ON listings "
+                "FOR EACH ROW EXECUTE FUNCTION listings_search_vector_update()"
+            )
+            # One-time backfill for rows written before this migration (the trigger only
+            # covers inserts/updates from here on); idempotent via the IS NULL filter, so
+            # it's a no-op on every startup after the first.
+            conn.execute(
+                f"UPDATE listings SET search_vector = "
+                f"{_SEARCH_VECTOR_EXPR.format(name='name', description='description', task_categories='task_categories')} "
+                "WHERE search_vector IS NULL"
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS listings_search_vector_gin_idx ON listings USING GIN (search_vector)")
+
+            # pg_trgm is an optional enhancement (typo tolerance when full-text finds
+            # nothing), not a hard dependency: if an environment won't allow the extension,
+            # full-text search still works completely - only that one fallback is skipped.
+            try:
+                conn.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS listings_trigram_gin_idx ON listings USING GIN (trigram_text gin_trgm_ops)"
+                )
+                _trigram_available = True
+            except Exception:  # noqa: BLE001
+                logger.warning("pg_trgm unavailable; the typo-tolerant search fallback is disabled", exc_info=True)
+                _trigram_available = False
+
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS search_log (
+                    id SERIAL PRIMARY KEY,
+                    query TEXT NOT NULL,
+                    result_count INTEGER NOT NULL,
+                    searched_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS search_log_searched_at_idx ON search_log (searched_at)")
         _schema_ready = True
 
 
@@ -250,6 +341,66 @@ def record_heartbeat(listing_id: str, now: datetime, cutoff: datetime) -> dict[s
         ).fetchone()
 
 
+def _filter_conditions(
+    status: str | None, include_test: bool, listing_type: str | None, task_categories: list[str] | None
+) -> tuple[list[str], dict[str, Any]]:
+    """The filters shared by every search mode below (status/include_test/listing_type/
+    task_categories) - everything except q itself, which each mode applies differently."""
+    conditions = ["status = %(status)s"]
+    params: dict[str, Any] = {"status": status if status is not None else "active"}
+    if not include_test:
+        conditions.append("NOT is_test")
+    if listing_type is not None:
+        conditions.append("listing_type = %(listing_type)s")
+        params["listing_type"] = listing_type
+    if task_categories:
+        conditions.append("task_categories && %(task_categories)s::text[]")
+        params["task_categories"] = task_categories
+    return conditions, params
+
+
+def _log_search_query(conn: psycopg.Connection, query: str, result_count: int) -> None:
+    """Query text, result count and timestamp only - no IP, no other request data.
+    Best-effort: a logging failure must never break a search."""
+    try:
+        conn.execute(
+            "INSERT INTO search_log (query, result_count, searched_at) VALUES (%s, %s, %s)",
+            (query, result_count, datetime.now(timezone.utc)),
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("failed to log a search query", exc_info=True)
+
+
+def _paged(
+    conn: psycopg.Connection,
+    *,
+    where: str,
+    params: dict[str, Any],
+    order_expr: str,
+    cursor_expr: str | None,
+    cursor_params: dict[str, Any],
+    limit: int,
+    offset: int,
+    cursor_value_expr: str | None,
+) -> list[dict[str, Any]]:
+    """One page of listings rows, ordered by `order_expr` DESC, id DESC, each carrying an
+    extra `_cursor_value` column (from `cursor_value_expr`) when one is given - the raw
+    value the caller needs to build the next page's cursor, popped off before a row is
+    ever shown to an API caller. Fetches limit+1 rows so has_more can be read off the
+    length without a second query."""
+    conditions = where
+    all_params = dict(params)
+    if cursor_expr is not None:
+        conditions = f"{where} AND {cursor_expr}"
+        all_params.update(cursor_params)
+    select_extra = f", {cursor_value_expr} AS _cursor_value" if cursor_value_expr else ""
+    return conn.execute(
+        f"SELECT {_READ}{select_extra} FROM listings WHERE {conditions} "
+        f"ORDER BY {order_expr} DESC, id DESC LIMIT %(limit)s OFFSET %(offset)s",
+        {**all_params, "limit": limit + 1, "offset": offset},
+    ).fetchall()
+
+
 def list_listings(
     *,
     listing_type: str | None,
@@ -258,52 +409,121 @@ def list_listings(
     status: str | None,
     limit: int,
     offset: int,
-    cursor: tuple[datetime, str] | None = None,
+    cursor: AnyCursor | None = None,
     include_test: bool = False,
-) -> tuple[list[dict[str, Any]], int, bool]:
-    """Returns (page of rows, total matching the filters, whether more rows follow).
-    Order is newest last activity first, id as the tiebreaker - a total order, so a
-    cursor (last_activity_at, id) is a stable resume point."""
-    conditions: list[str] = []
-    params: dict[str, Any] = {}
+) -> tuple[list[dict[str, Any]], int, bool, str]:
+    """Returns (page of rows, total matching the filters, whether more rows follow, mode).
 
-    conditions.append("status = %(status)s")
-    params["status"] = status if status is not None else "active"
-    if not include_test:
-        conditions.append("NOT is_test")
+    No `q`: newest last activity first, id as tiebreaker (unchanged from before search
+    had ranking) - `cursor` here is an ActivityCursor, and `mode` is always "activity".
 
-    if listing_type is not None:
-        conditions.append("listing_type = %(listing_type)s")
-        params["listing_type"] = listing_type
+    With `q`: full-text search (websearch_to_tsquery against name/description/
+    task_categories, weighted name > description > categories), ranked by ts_rank, id as
+    tiebreaker - `cursor` is a RankCursor and `mode` is "rank". If that finds nothing at
+    all, falls back to a pg_trgm similarity search (typo/partial-word tolerance) ordered
+    by similarity, id as tiebreaker - `cursor` is a SimilarityCursor and `mode` is
+    "similarity". Which of the two a multi-page search continues in is decided once, on
+    the first page, and then driven by the cursor itself on every later page (see
+    app/core/pagination.py), not re-decided per page.
 
-    if task_categories:
-        conditions.append("task_categories && %(task_categories)s::text[]")
-        params["task_categories"] = task_categories
+    `mode` tells the caller which cursor-encoding function to use for the next page; every
+    row also carries a transient `_cursor_value` key (the raw ordering value for that row -
+    last_activity_at/rank/similarity, or absent when `mode` is "activity") that must be
+    popped before a row is returned from the API - only the last row's value is actually
+    needed, but it's cheap to leave on every row rather than special-casing.
 
-    if q:
-        # Explicit ESCAPE clause: a caller typing a literal '%' or '_' searches for
-        # that literal character rather than it acting as a LIKE wildcard.
-        escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        conditions.append("(name ILIKE %(q)s ESCAPE '\\' OR description ILIKE %(q)s ESCAPE '\\')")
-        params["q"] = f"%{escaped}%"
-
-    total_where = " AND ".join(conditions)
-
-    page_conditions = list(conditions)
-    page_params = dict(params)
-    if cursor is not None:
-        page_conditions.append(f"(({ACTIVITY_SQL}), id) < (%(cursor_activity)s, %(cursor_id)s)")
-        page_params["cursor_activity"], page_params["cursor_id"] = cursor
-    page_where = " AND ".join(page_conditions)
+    Every search this is given (every call with a non-empty q) is logged to search_log:
+    the query text, the total result count, and when - nothing else.
+    """
+    conditions, params = _filter_conditions(status, include_test, listing_type, task_categories)
+    where = " AND ".join(conditions)
 
     with _connection() as conn:
-        total = conn.execute(f"SELECT COUNT(*) AS n FROM listings WHERE {total_where}", params).fetchone()["n"]
-        rows = conn.execute(
-            f"SELECT {_READ} FROM listings WHERE {page_where} "
-            f"ORDER BY ({ACTIVITY_SQL}) DESC, id DESC LIMIT %(limit)s OFFSET %(offset)s",
-            {**page_params, "limit": limit + 1, "offset": offset},
-        ).fetchall()
-    return rows[:limit], total, len(rows) > limit
+        if not q:
+            cursor_expr, cursor_params = None, {}
+            if cursor is not None:
+                cursor_expr = f"(({ACTIVITY_SQL}), id) < (%(cursor_activity)s, %(cursor_id)s)"
+                cursor_params = {"cursor_activity": cursor.activity, "cursor_id": cursor.id}
+            total = conn.execute(f"SELECT COUNT(*) AS n FROM listings WHERE {where}", params).fetchone()["n"]
+            rows = _paged(
+                conn, where=where, params=params, order_expr=f"({ACTIVITY_SQL})",
+                cursor_expr=cursor_expr, cursor_params=cursor_params, limit=limit, offset=offset,
+                cursor_value_expr=None,
+            )
+            return rows[:limit], total, len(rows) > limit, "activity"
+
+        # q given: decide full-text vs. trigram once (first page), then trust the cursor's
+        # own mode for every later page of the same search.
+        mode = cursor.mode if cursor is not None else None  # "rank" | "similarity" | None (first page)
+        ft_conditions = conditions + ["search_vector @@ websearch_to_tsquery('english', %(q)s)"]
+        ft_where = " AND ".join(ft_conditions)
+        ft_params = {**params, "q": q}
+        # The ::double precision cast matters for cursor correctness, not just style:
+        # ts_rank returns `real` (float4), and Postgres's default text formatting for
+        # `real` doesn't carry enough digits to round-trip exactly - a cursor value
+        # fetched out, sent back as a parameter, and compared with `=` against a freshly
+        # computed `real` can come back NOT equal, which silently breaks the keyset
+        # predicate below (confirmed empirically: pagination never advanced). Casting to
+        # double precision here makes the round trip exact.
+        rank_expr = "ts_rank(search_vector, websearch_to_tsquery('english', %(q)s))::double precision"
+
+        if mode is None:
+            ft_total = conn.execute(f"SELECT COUNT(*) AS n FROM listings WHERE {ft_where}", ft_params).fetchone()["n"]
+            mode = "rank" if ft_total > FULLTEXT_FALLBACK_THRESHOLD else "similarity"
+        else:
+            ft_total = None  # already committed to `mode` by the cursor; computed below only if needed
+
+        if mode == "rank":
+            total = ft_total if ft_total is not None else conn.execute(
+                f"SELECT COUNT(*) AS n FROM listings WHERE {ft_where}", ft_params
+            ).fetchone()["n"]
+            cursor_expr, cursor_params = None, {}
+            if cursor is not None:
+                cursor_expr = f"({rank_expr}, id) < (%(cursor_rank)s, %(cursor_id)s)"
+                cursor_params = {"cursor_rank": cursor.value, "cursor_id": cursor.id}
+            rows = _paged(
+                conn, where=ft_where, params=ft_params, order_expr=rank_expr,
+                cursor_expr=cursor_expr, cursor_params=cursor_params, limit=limit, offset=offset,
+                cursor_value_expr=rank_expr,
+            )
+        elif _trigram_available:
+            # word_similarity(query, document), not similarity(): plain trigram
+            # similarity divides by the UNION of trigrams in both strings, so a short
+            # query against a long name+description dilutes to near zero no matter how
+            # good a match it is (confirmed empirically: ~0.01 for a real typo against a
+            # realistic listing description). word_similarity instead scores the best-
+            # matching EXTENT of the document against the query, which is what "does
+            # this listing contain something close to what they typed" actually means.
+            # Cast to double precision for the same round-trip-exactness reason as
+            # rank_expr above - word_similarity also returns `real`.
+            sim_expr = "word_similarity(%(q)s, trigram_text)::double precision"
+            # The `<%` operator (not a raw word_similarity(...) > threshold comparison)
+            # is what lets the planner use the trigram GIN index here.
+            # `%%` because this SQL text is itself a psycopg pyformat template: a bare
+            # `%` (as in the `<%` operator) would be misread as a placeholder escape.
+            trgm_conditions = conditions + ["%(q)s <%% trigram_text"]
+            trgm_where = " AND ".join(trgm_conditions)
+            cursor_expr, cursor_params = None, {}
+            if cursor is not None:
+                cursor_expr = f"({sim_expr}, id) < (%(cursor_sim)s, %(cursor_id)s)"
+                cursor_params = {"cursor_sim": cursor.value, "cursor_id": cursor.id}
+            with conn.transaction():
+                # SET LOCAL takes no query parameters; the threshold is an internal
+                # constant, never user input, so inlining it is safe. Scoped to this
+                # transaction only - the pool's connections stay in autocommit between
+                # requests.
+                conn.execute(f"SET LOCAL pg_trgm.word_similarity_threshold = {TRIGRAM_SIMILARITY_THRESHOLD}")
+                total = conn.execute(f"SELECT COUNT(*) AS n FROM listings WHERE {trgm_where}", ft_params).fetchone()["n"]
+                rows = _paged(
+                    conn, where=trgm_where, params=ft_params, order_expr=sim_expr,
+                    cursor_expr=cursor_expr, cursor_params=cursor_params, limit=limit, offset=offset,
+                    cursor_value_expr=sim_expr,
+                )
+        else:
+            total, rows = 0, []  # trigram mode was chosen (full-text found nothing) but pg_trgm isn't available here
+
+        _log_search_query(conn, q, total)
+        return rows[:limit], total, len(rows) > limit, mode
 
 
 def purge_expired_test_listings(cutoff: datetime, limit: int) -> list[str]:
