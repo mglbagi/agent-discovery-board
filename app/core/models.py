@@ -440,9 +440,10 @@ class ListingNextAction(BaseModel):
     networks: list[str] = Field(default_factory=list, description="CAIP-2 network ids this can be paid on, if any.")
     body: dict[str, Any] | None = Field(
         default=None,
-        description="For verify_output: a suggested request body - {schema, rules, bounds, enforce_rules} as "
-        "applicable (rules/bounds/enforce_rules only when the listing declared verification) - with `output` "
-        "left for the caller to fill in with the service's actual result.",
+        description="For verify_output: a suggested request body for the verifier's POST /verify/schema or "
+        "verify_schema MCP tool - task_id, expected_schema, submitted_output, plus rules/bounds/enforce_rules "
+        "when the listing declared verification - with task_id and submitted_output left for the caller to "
+        "fill in (field names match the verifier's own API exactly).",
     )
 
 

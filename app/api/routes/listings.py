@@ -126,19 +126,28 @@ def _next_actions(row: dict[str, Any]) -> list[ListingNextAction]:
     ]
     if row.get("output_schema") is not None:
         verification = row.get("verification") or {}
-        body = {"output": "<fill in with this service's actual output>", "schema": row["output_schema"]}
+        # Field names match the verifier's own POST /verify/schema and verify_schema MCP
+        # tool exactly (task_id/expected_schema/submitted_output, confirmed against its
+        # live OpenAPI spec and MCP tool schema) - this board does not invent its own
+        # vocabulary for a body a caller is meant to send on, unmodified apart from
+        # task_id/submitted_output, to a different service.
+        body = {
+            "task_id": "<fill in with your own identifier for this check>",
+            "expected_schema": row["output_schema"],
+            "submitted_output": "<fill in with this service's actual output>",
+        }
         if verification.get("rules"):
             body["rules"] = verification["rules"]
         if verification.get("bounds"):
             body["bounds"] = verification["bounds"]
         if verification.get("enforce_rules"):
             body["enforce_rules"] = True
-        description = "POST this body to the sibling verification service's /verify/schema to check the "
+        description = "POST this body (fill in task_id and submitted_output) to the sibling verification "
+        description += "service's /verify/schema or its verify_schema MCP tool to check the output against the "
         description += (
-            "output against the schema AND run its cross-field rules/bounds (enforce_rules: true), not just the "
-            "schema. "
+            "schema AND run its cross-field rules/bounds (enforce_rules: true), not just the schema. "
             if "rules" in body or "bounds" in body or "enforce_rules" in body
-            else "output against the schema. "
+            else "schema. "
         )
         description += "See that service's own docs for its exact response shape and pricing."
         actions.append(

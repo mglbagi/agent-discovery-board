@@ -224,8 +224,9 @@ def _build_listings_extension() -> dict[str, Any]:
                 "(this listing's own endpoint_url, a best-effort method, price and networks - the board does not "
                 "verify a listed service's actual HTTP method), and, when output_schema is set, a verify_output "
                 "entry pointing at the sibling verification service's POST /verify/schema, with a suggested "
-                "`body` ({schema, rules, bounds, enforce_rules} as applicable) so a caller runs the full check, "
-                "not just the schema, when the listing declared verification. Distinct from the error "
+                "`body` using that service's own field names exactly (task_id, expected_schema, "
+                "submitted_output, plus rules/bounds/enforce_rules when the listing declared verification) - "
+                "fill in task_id and submitted_output and send it on unmodified. Distinct from the error "
                 "next_actions (params.errors.nextActionsConvention), which are about recovering from a failed "
                 "call to THIS board.",
                 "schema": ListingNextAction.model_json_schema(),

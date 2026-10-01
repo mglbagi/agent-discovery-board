@@ -234,8 +234,10 @@ def test_output_schema_adds_a_verify_output_next_action() -> None:
     verify = actions["verify_output"]
     assert verify["url"] == f"{VERIFICATION_SERVICE_URL}/verify/schema"
     assert verify["method"] == "POST"
-    assert verify["body"]["schema"] == listing["output_schema"]
-    assert "rules" not in verify["body"] and "enforce_rules" not in verify["body"]  # no verification set
+    # Field names match the verifier's own POST /verify/schema and verify_schema MCP
+    # tool exactly - confirmed against its live OpenAPI spec, not guessed.
+    assert set(verify["body"]) == {"task_id", "expected_schema", "submitted_output"}
+    assert verify["body"]["expected_schema"] == listing["output_schema"]
 
 
 def test_verification_folds_rules_and_enforce_rules_into_the_verify_output_body() -> None:
@@ -247,7 +249,7 @@ def test_verification_folds_rules_and_enforce_rules_into_the_verify_output_body(
     }
     listing = _create(_marker(), output_schema=schema, verification=verification)
     verify = next(a for a in listing["next_actions"] if a["action"] == "verify_output")
-    assert verify["body"]["schema"] == schema
+    assert verify["body"]["expected_schema"] == schema
     assert verify["body"]["rules"] == verification["rules"]
     assert verify["body"]["bounds"] == verification["bounds"]
     assert verify["body"]["enforce_rules"] is True
