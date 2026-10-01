@@ -21,10 +21,11 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
-from app.core.activity import ACTIVITY_SQL
+from app.core.activity import ACTIVITY_SQL, STALE_AFTER_DAYS
 from app.core.constants import DUPLICATE_GUARDED_LISTING_TYPE
 from app.core.endpoint import normalize_endpoint_url
 from app.core.pagination import AnyCursor
+from app.core.stablecoins import stablecoin_keys
 
 logger = logging.getLogger("app.db")
 
@@ -262,6 +263,11 @@ def _ensure_schema() -> None:
                 )
                 """
             )
+
+            # --- Agent navigation: structured filters, facets, templates ---------------------
+            # A JSON Schema for this service's output, if it has one (has_template filter and
+            # a listing's verify_output next_action - see app/api/routes/listings.py).
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS output_schema JSONB")
         _schema_ready = True
 
 
@@ -292,6 +298,7 @@ _COLUMNS = (
     "payment_wallet", "pricing_model", "pricing_amount", "payment_options", "erc8004_identity",
     "verification_agent_id", "submitted_by", "status", "is_test", "created_at", "updated_at", "last_seen_at",
     "claimed", "source", "source_url", "imported_at", "last_synced_at", "missing_from_source_since",
+    "output_schema",
 )
 # last_seen_at is only ever set by heartbeat; missing_from_source_since only by a sync noticing
 # a listing is gone. Every create_listing() caller supplies the rest, including the import path.
@@ -303,13 +310,18 @@ def _prepare(params: dict[str, Any]) -> dict[str, Any]:
     out = dict(params)
     if "payment_options" in out:
         out["payment_options"] = Jsonb(out["payment_options"] or [])
+    if "output_schema" in out and out["output_schema"] is not None:
+        out["output_schema"] = Jsonb(out["output_schema"])
     return out
 
 
 # Defaults for columns a caller may not know or care about - an organic listing (the
 # overwhelming common case) is claimed from the start with no import metadata at all.
 # The import path (app/core/imports.py's build_import_row) always sets these explicitly.
-_CREATE_DEFAULTS = {"claimed": True, "source": None, "source_url": None, "imported_at": None, "last_synced_at": None}
+_CREATE_DEFAULTS = {
+    "claimed": True, "source": None, "source_url": None, "imported_at": None, "last_synced_at": None,
+    "output_schema": None,
+}
 
 
 def create_listing(row: dict[str, Any]) -> dict[str, Any]:
@@ -388,10 +400,14 @@ def _filter_conditions(
     listing_type: str | None,
     task_categories: list[str] | None,
     claimed: bool | None = None,
+    payment_network: str | None = None,
+    max_price: float | None = None,
+    has_template: bool | None = None,
+    stale: bool | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
     """The filters shared by every search mode below (status/include_test/listing_type/
-    task_categories/claimed) - everything except q itself, which each mode applies
-    differently."""
+    task_categories/claimed/payment_network/max_price/has_template/stale) - everything
+    except q itself, which each mode applies differently."""
     conditions = ["status = %(status)s"]
     params: dict[str, Any] = {"status": status if status is not None else "active"}
     if not include_test:
@@ -405,6 +421,39 @@ def _filter_conditions(
     if claimed is not None:
         conditions.append("claimed = %(claimed)s")
         params["claimed"] = claimed
+    if payment_network is not None or max_price is not None:
+        # One payment_option must satisfy BOTH the network and the price cap together,
+        # not either independently - "pay for this on Base for under $0.05" means one
+        # entry matching both, not any entry matching one.
+        #
+        # max_price is USD. A payment_option's `amount` is a decimal string in that
+        # ASSET's own whole-token units (PaymentOption's own docs: "0.02" means 0.02 of
+        # the asset, not an atomic/smallest unit) - directly comparable to a USD figure
+        # only for a recognized USD stablecoin (~1 token = $1; app/core/stablecoins.py),
+        # since this board has no price oracle for anything else. A max_price filter
+        # therefore only ever matches stablecoin payment_options; a listing priced only
+        # in ETH, SOL or some other token is excluded from it entirely, not guessed at.
+        conditions.append(
+            "EXISTS (SELECT 1 FROM jsonb_array_elements(payment_options) AS po WHERE "
+            "(%(payment_network)s::text IS NULL OR po->>'network' = %(payment_network)s) AND "
+            "(%(max_price)s::numeric IS NULL OR ("
+            "(po->>'network' || '|' || lower(po->>'asset')) = ANY(%(stablecoin_keys)s) AND "
+            "(po->>'amount')::numeric <= %(max_price)s)))"
+        )
+        params["payment_network"] = payment_network
+        params["max_price"] = max_price
+        params["stablecoin_keys"] = stablecoin_keys()
+    if has_template is not None:
+        conditions.append("output_schema IS NOT NULL" if has_template else "output_schema IS NULL")
+    if stale is not None:
+        # Mirrors app/core/activity.py's is_stale() exactly: missing from an import sync,
+        # or no activity for longer than the configured threshold.
+        stale_expr = (
+            f"(missing_from_source_since IS NOT NULL OR "
+            f"now() - ({ACTIVITY_SQL}) > %(stale_days)s * interval '1 day')"
+        )
+        conditions.append(stale_expr if stale else f"NOT {stale_expr}")
+        params["stale_days"] = STALE_AFTER_DAYS
     return conditions, params
 
 
@@ -461,6 +510,10 @@ def list_listings(
     cursor: AnyCursor | None = None,
     include_test: bool = False,
     claimed: bool | None = None,
+    payment_network: str | None = None,
+    max_price: float | None = None,
+    has_template: bool | None = None,
+    stale: bool | None = None,
 ) -> tuple[list[dict[str, Any]], int, bool, str]:
     """Returns (page of rows, total matching the filters, whether more rows follow, mode).
 
@@ -486,9 +539,14 @@ def list_listings(
     the query text, the total result count, and when - nothing else.
 
     `claimed`: None (default) applies no filter; True/False restrict to claimed or
-    unclaimed (imported, not yet claimed) listings respectively.
+    unclaimed (imported, not yet claimed) listings respectively. `payment_network`/
+    `max_price`: match a single payment_option satisfying both together when both are
+    given. `has_template`: output_schema is/isn't set. `stale`: mirrors is_stale()
+    exactly (app/core/activity.py).
     """
-    conditions, params = _filter_conditions(status, include_test, listing_type, task_categories, claimed)
+    conditions, params = _filter_conditions(
+        status, include_test, listing_type, task_categories, claimed, payment_network, max_price, has_template, stale
+    )
     where = " AND ".join(conditions)
 
     with _connection() as conn:
@@ -579,6 +637,79 @@ def list_listings(
         return rows[:limit], total, len(rows) > limit, mode
 
 
+def _facet_breakdowns(conn: psycopg.Connection, where: str, params: dict[str, Any]) -> dict[str, Any]:
+    total = conn.execute(f"SELECT COUNT(*) AS n FROM listings WHERE {where}", params).fetchone()["n"]
+    by_category = {
+        r["c"]: r["n"]
+        for r in conn.execute(
+            f"SELECT c, COUNT(*) AS n FROM listings, unnest(task_categories) AS c WHERE {where} GROUP BY c", params
+        ).fetchall()
+    }
+    by_type = {
+        r["listing_type"]: r["n"]
+        for r in conn.execute(f"SELECT listing_type, COUNT(*) AS n FROM listings WHERE {where} GROUP BY listing_type", params).fetchall()
+    }
+    by_network = {
+        r["network"]: r["n"]
+        for r in conn.execute(
+            "SELECT po->>'network' AS network, COUNT(DISTINCT listings.id) AS n FROM listings, "
+            f"jsonb_array_elements(payment_options) AS po WHERE {where} GROUP BY po->>'network'",
+            params,
+        ).fetchall()
+    }
+    by_source = {
+        (r["source"] or "none"): r["n"]
+        for r in conn.execute(f"SELECT source, COUNT(*) AS n FROM listings WHERE {where} GROUP BY source", params).fetchall()
+    }
+    return {"total": total, "by_task_category": by_category, "by_listing_type": by_type, "by_network": by_network, "by_source": by_source}
+
+
+def facet_counts(
+    *,
+    listing_type: str | None,
+    task_categories: list[str] | None,
+    q: str | None,
+    status: str | None,
+    include_test: bool = False,
+    claimed: bool | None = None,
+    payment_network: str | None = None,
+    max_price: float | None = None,
+    has_template: bool | None = None,
+    stale: bool | None = None,
+) -> dict[str, Any]:
+    """Counts of matching listings per task_category, listing_type, payment network and
+    import source, for the same filters (including q) GET /listings accepts - so an
+    agent can see what's out there before deciding how to narrow a search. Not
+    paginated: a small, mostly-fixed number of buckets per dimension, not one row per
+    listing. Logs q the same way list_listings does, when given."""
+    conditions, params = _filter_conditions(
+        status, include_test, listing_type, task_categories, claimed, payment_network, max_price, has_template, stale
+    )
+    where = " AND ".join(conditions)
+
+    with _connection() as conn:
+        if not q:
+            return _facet_breakdowns(conn, where, params)
+
+        ft_conditions = conditions + ["search_vector @@ websearch_to_tsquery('english', %(q)s)"]
+        ft_where = " AND ".join(ft_conditions)
+        ft_params = {**params, "q": q}
+        ft_total = conn.execute(f"SELECT COUNT(*) AS n FROM listings WHERE {ft_where}", ft_params).fetchone()["n"]
+
+        if ft_total > FULLTEXT_FALLBACK_THRESHOLD:
+            result = _facet_breakdowns(conn, ft_where, ft_params)
+        elif _trigram_available:
+            with conn.transaction():
+                conn.execute(f"SET LOCAL pg_trgm.word_similarity_threshold = {TRIGRAM_SIMILARITY_THRESHOLD}")
+                trgm_where = " AND ".join(conditions + ["%(q)s <%% trigram_text"])
+                result = _facet_breakdowns(conn, trgm_where, ft_params)
+        else:
+            result = _facet_breakdowns(conn, where + " AND FALSE", params)
+
+        _log_search_query(conn, q, result["total"])
+        return result
+
+
 def purge_expired_test_listings(cutoff: datetime, limit: int) -> list[str]:
     """Delete up to `limit` test listings created before `cutoff` (oldest first); returns
     their ids. One indexed statement (listings_test_created_idx); only is_test rows can
@@ -649,7 +780,7 @@ def is_in_do_not_import(source: str, endpoint_url: str) -> bool:
 _IMPORT_REFRESHABLE_COLUMNS = (
     "name", "description", "listing_type", "task_categories", "endpoint_url", "payment_wallet",
     "pricing_model", "pricing_amount", "payment_options", "erc8004_identity", "verification_agent_id",
-    "source_url",
+    "source_url", "output_schema",
 )
 
 

@@ -70,6 +70,7 @@ ERROR_CODES: dict[str, ErrorSpec] = {
     ),
     "listing_inactive": ErrorSpec(409, False, "The listing is inactive; reactivate it with PATCH status=active first."),
     "already_claimed": ErrorSpec(409, False, "This listing has already been claimed; it cannot be claimed again."),
+    "no_template": ErrorSpec(404, False, "This listing has no output_schema set."),
     "not_imported": ErrorSpec(
         422,
         False,

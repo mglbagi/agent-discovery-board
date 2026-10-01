@@ -1,12 +1,12 @@
 """MCP (Model Context Protocol) access path for browsing the Agent Discovery Board -
-a second, additive way to reach `GET /listings`' exact search/filter/badge behavior,
-alongside the REST endpoint, never replacing it.
+a second, additive way to reach the REST API's exact search/filter/badge behavior,
+alongside it, never replacing it.
 
-One tool, `search_listings`. It does not reimplement anything: it calls the very
-same `search_listings` function (app/api/routes/listings.py) that the REST route
-calls, so there is exactly one place that queries, filters and attaches trust
-badges to listings - both access paths return identical results for identical
-filters.
+Four tools - search_listings, get_listing, list_facets, get_template - none of which
+reimplement anything: each calls the very same function app/api/routes/listings.py's
+REST routes call, so there is exactly one place that queries, filters and attaches
+trust badges to listings - both access paths return identical results for identical
+filters/ids.
 
 Free and unauthenticated, matching the REST endpoint and this service's whole
 design: there is no payment gate anywhere on this service's own endpoints (see
@@ -21,6 +21,7 @@ rate limit on this service (app/core/rate_limit.py), via a dedicated
 
 import json
 import os
+import re
 from typing import Annotated
 from urllib.parse import urlparse
 
@@ -31,14 +32,25 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from app.api.routes.listings import search_listings
+from app.api.routes.listings import get_listing, get_template, list_facets, search_listings
 from app.core.constants import KNOWN_LISTING_TYPES, TASK_CATEGORIES
-from app.core.errors import MCP_TOOL_METHOD, action, build_error_body, resolve_http_exception
+from app.core.errors import ApiError, MCP_TOOL_METHOD, action, build_error_body, resolve_http_exception
 from app.core.rate_limit import mcp_search_limiter
 
 SERVER_NAME = "Agent Discovery Board"
 TOOL_NAME = "search_listings"
+GET_LISTING_TOOL_NAME = "get_listing"
+LIST_FACETS_TOOL_NAME = "list_facets"
+GET_TEMPLATE_TOOL_NAME = "get_template"
 MCP_PATH = "/mcp"
+
+_LISTING_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def _validate_listing_id(listing_id: str) -> None:
+    if not _LISTING_ID_RE.match(listing_id):
+        raise ApiError(422, "validation_error", "listing_id must be a UUID.")
+
 
 TOOL_DESCRIPTION = (
     "Searches and browses the Agent Discovery Board: a directory of AI agent "
@@ -65,20 +77,37 @@ TOOL_DESCRIPTION = (
     "is set. Some listings are imported from third-party directories rather than "
     "self-submitted - these carry `claimed: false`, `source` and `source_url` until "
     "their real owner (whoever controls payment_wallet) claims them; filter with "
-    "`claimed`. Free to call, no payment or account required. Errors come back as "
-    "isError results with a stable `error_code` and `next_actions`."
+    "`claimed`. Also filterable: payment_network (CAIP-2 chain id), max_price (a USD "
+    "amount; only matches a payment_option in a recognized USD stablecoin - see the "
+    "manifest's search.stablecoins for the exact list - since that's the only asset "
+    "type comparable to a dollar figure without a price oracle; paired with "
+    "payment_network in the same payment_option if both given), has_template "
+    "(output_schema is set) and stale - "
+    "all combine with `q`. Each result's "
+    "`next_actions` says how to call the service (endpoint, price, networks) and, if "
+    "it has an output_schema, how to verify its output with the sibling verification "
+    "service. Pass compact=true for a reduced shape (id, name, endpoint_url, price, "
+    "networks, task_categories, claimed) when just scanning many results. See also "
+    "get_listing (one by id), list_facets (counts per dimension) and get_template. "
+    "Free to call, no payment or account required. Errors come back as isError results "
+    "with a stable `error_code` and `next_actions`."
 )
 
 SERVER_INSTRUCTIONS = (
-    "This server exposes one tool, search_listings: search and filter the Agent "
-    "Discovery Board's directory of agent-submitted service listings by "
-    "listing_type, task_category, and free text, with pagination. Every result "
-    "is self-reported by whoever submitted it, not verified by this service, "
-    "except where a `badge` field is present (a live trust-score lookup against "
-    "a separate verification service - null means no data, not a bad sign). "
-    "Free, no payment, no account needed. See GET /listings on the REST API for "
-    "the same search over HTTP, and POST /listings to submit a new listing "
-    "(submission isn't available as an MCP tool - use the REST endpoint)."
+    "This server exposes four tools for the Agent Discovery Board's directory of "
+    "agent-submitted service listings: search_listings (search/filter by listing_type, "
+    "task_category, free text, payment_network, max_price, claimed, has_template, "
+    "stale, with pagination), get_listing (fetch one by id), list_facets (counts per "
+    "category/listing_type/network/source for the same filters, to explore before "
+    "narrowing a search), and get_template (a listing's declared output_schema, for "
+    "verifying a call's result). Every result is self-reported by whoever submitted "
+    "it, not verified by this service, except where a `badge` field is present (a "
+    "live trust-score lookup against a separate verification service - null means no "
+    "data, not a bad sign). Each listing's next_actions says how to call it and, if it "
+    "has an output_schema, how to verify its output. Free, no payment, no account "
+    "needed. See GET /listings on the REST API for the same search over HTTP, and "
+    "POST /listings to submit a new listing (submission isn't available as an MCP "
+    "tool - use the REST endpoint)."
 )
 
 _TOOL_ANNOTATIONS = ToolAnnotations(
@@ -107,20 +136,20 @@ def _client_ip(ctx: Context | None) -> str:
     return "unknown"
 
 
-def _mcp_next_actions(code: str, extras: dict) -> list[dict]:
+def _mcp_next_actions(code: str, extras: dict, tool_name: str) -> list[dict]:
     if code == "rate_limited":
         wait = extras.get("retry_after")
         when = f"after {wait} seconds" if wait is not None else "later"
-        return [action(MCP_TOOL_METHOD, TOOL_NAME, [], f"Call {TOOL_NAME} again {when}.")]
+        return [action(MCP_TOOL_METHOD, tool_name, [], f"Call {tool_name} again {when}.")]
     if code == "invalid_cursor":
-        return [action(MCP_TOOL_METHOD, TOOL_NAME, [], "Call again without a cursor to restart from the first page.")]
+        return [action(MCP_TOOL_METHOD, tool_name, [], "Call again without a cursor to restart from the first page.")]
     return [
-        action(MCP_TOOL_METHOD, TOOL_NAME, [], "Correct the argument named in `detail` and call again."),
+        action(MCP_TOOL_METHOD, tool_name, [], "Correct the argument named in `detail` and call again."),
         action("GET", "/.well-known/agent-card.json", [], "Fetch allowed values (task categories, listing types) and error codes."),
     ]
 
 
-def _error_result(exc: HTTPException) -> CallToolResult:
+def _error_result(exc: HTTPException, tool_name: str = TOOL_NAME) -> CallToolResult:
     """Same machine-readable shape as the REST errors (error_code, message, detail,
     next_actions), plus the tool's original `error`, `status` and `retryable` keys."""
     code, extras, _ = resolve_http_exception(exc)
@@ -128,9 +157,9 @@ def _error_result(exc: HTTPException) -> CallToolResult:
         code=code,
         detail=exc.detail,
         method=MCP_TOOL_METHOD,
-        path=TOOL_NAME,
+        path=tool_name,
         extras=extras,
-        next_actions=_mcp_next_actions(code, extras),
+        next_actions=_mcp_next_actions(code, extras, tool_name),
     )
     body.update({"error": str(exc.detail), "status": exc.status_code, "retryable": exc.status_code == 429})
     return CallToolResult(content=[TextContent(type="text", text=json.dumps(body))], isError=True)
@@ -188,6 +217,36 @@ async def _search_listings_tool(
             "only (see the `claimed`/`source` response fields), omitted for no filter.",
         ),
     ] = None,
+    payment_network: Annotated[
+        str | None,
+        Field(default=None, description="CAIP-2 chain id, e.g. 'eip155:8453'. Only listings payable on this network."),
+    ] = None,
+    max_price: Annotated[
+        float | None,
+        Field(
+            default=None, ge=0,
+            description="A USD amount. Only matches a payment_option in a recognized USD stablecoin (currently "
+            "USDC on Base/Ethereum/Solana); a listing priced only in a non-stablecoin asset (ETH, SOL, etc.) is "
+            "excluded, not guessed at - this board has no price oracle. Combined with payment_network, both "
+            "must be satisfied by the same payment_option.",
+        ),
+    ] = None,
+    has_template: Annotated[
+        bool | None,
+        Field(default=None, description="Filter by whether output_schema is set (a declared output template)."),
+    ] = None,
+    stale: Annotated[
+        bool | None,
+        Field(default=None, description="Filter by the `stale` response field."),
+    ] = None,
+    compact: Annotated[
+        bool,
+        Field(
+            default=False,
+            description="Return compact items (id, name, endpoint_url, price, networks, task_categories, "
+            "claimed) instead of the full shape - cheaper for scanning many results.",
+        ),
+    ] = False,
     ctx: Context | None = None,
 ) -> CallToolResult:
     try:
@@ -206,6 +265,11 @@ async def _search_listings_tool(
             cursor=cursor,
             include_test=include_test,
             claimed=claimed,
+            payment_network=payment_network,
+            max_price=max_price,
+            has_template=has_template,
+            stale=stale,
+            compact=compact,
         )
     except HTTPException as exc:
         return _error_result(exc)
@@ -217,6 +281,117 @@ async def _search_listings_tool(
 
 
 _search_listings_tool.__name__ = TOOL_NAME
+
+GET_LISTING_DESCRIPTION = (
+    "Fetch one listing by id - the same data GET /listings/{id} returns, including "
+    "next_actions (how to call the service, and how to verify its output if it has an "
+    "output_schema) and a live trust-score badge when configured. 404 not_found if the "
+    "id does not exist. Free, no payment or account required."
+)
+_GET_LISTING_ANNOTATIONS = ToolAnnotations(
+    title="Get one Agent Discovery Board listing", readOnlyHint=True, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False,
+)
+
+
+async def _get_listing_tool(
+    listing_id: Annotated[str, Field(description="The listing's id (a UUID), e.g. from search_listings.")],
+    ctx: Context | None = None,
+) -> CallToolResult:
+    try:
+        mcp_search_limiter.check_ip(_client_ip(ctx))
+        _validate_listing_id(listing_id)
+        listing = await get_listing(listing_id)
+    except HTTPException as exc:
+        return _error_result(exc, GET_LISTING_TOOL_NAME)
+    return CallToolResult(content=[TextContent(type="text", text=listing.model_dump_json())], isError=False)
+
+
+_get_listing_tool.__name__ = GET_LISTING_TOOL_NAME
+
+LIST_FACETS_DESCRIPTION = (
+    "Counts of matching listings per task_category, listing_type, payment network and "
+    "import source - takes the same filters as search_listings (including q and "
+    "max_price, a USD amount matched only against recognized USD stablecoins - see "
+    "search_listings' own description), so you can see what's out there before "
+    "deciding how to narrow a search, instead of paging through everything. Not "
+    "paginated: a small, mostly-fixed number of buckets per dimension, never one entry "
+    "per listing. Free, no payment or account required."
+)
+_LIST_FACETS_ANNOTATIONS = ToolAnnotations(
+    title="Facet counts for the Agent Discovery Board", readOnlyHint=True, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False,
+)
+
+
+async def _list_facets_tool(
+    listing_type: Annotated[
+        str | None,
+        Field(default=None, description=f"Filter to this exact listing_type. Starting set: {list(KNOWN_LISTING_TYPES)}."),
+    ] = None,
+    task_category: Annotated[
+        list[str] | None,
+        Field(default=None, description=f"Filter to listings tagged with any of these: {list(TASK_CATEGORIES)}."),
+    ] = None,
+    q: Annotated[str | None, Field(default=None, description="Same natural-language search as search_listings.")] = None,
+    status: Annotated[str | None, Field(default=None, description="'active' or 'inactive'; defaults to 'active' only.")] = None,
+    include_test: Annotated[bool, Field(default=False, description="Also include temporary test listings.")] = False,
+    claimed: Annotated[bool | None, Field(default=None, description="true/false/omitted, as in search_listings.")] = None,
+    payment_network: Annotated[str | None, Field(default=None, description="CAIP-2 chain id, e.g. 'eip155:8453'.")] = None,
+    max_price: Annotated[float | None, Field(default=None, ge=0, description="As in search_listings.")] = None,
+    has_template: Annotated[bool | None, Field(default=None, description="Filter by whether output_schema is set.")] = None,
+    stale: Annotated[bool | None, Field(default=None, description="Filter by the `stale` response field.")] = None,
+    ctx: Context | None = None,
+) -> CallToolResult:
+    try:
+        mcp_search_limiter.check_ip(_client_ip(ctx))
+        counts = await list_facets(
+            listing_type=listing_type,
+            task_category=task_category,
+            q=q,
+            status=status,
+            include_test=include_test,
+            claimed=claimed,
+            payment_network=payment_network,
+            max_price=max_price,
+            has_template=has_template,
+            stale=stale,
+        )
+    except HTTPException as exc:
+        return _error_result(exc, LIST_FACETS_TOOL_NAME)
+    return CallToolResult(content=[TextContent(type="text", text=counts.model_dump_json())], isError=False)
+
+
+_list_facets_tool.__name__ = LIST_FACETS_TOOL_NAME
+
+GET_TEMPLATE_DESCRIPTION = (
+    "The output_schema a listing has declared (most useful for a verification_profile "
+    "listing, but available on any listing that has one) - use it with the sibling "
+    "verification service's POST /verify/schema to check a call's actual output against "
+    "it (see that listing's next_actions for the exact shape). 404 no_template if the "
+    "listing has none set, not_found if the id does not exist. Free, no payment or "
+    "account required."
+)
+_GET_TEMPLATE_ANNOTATIONS = ToolAnnotations(
+    title="Get a listing's output template", readOnlyHint=True, destructiveHint=False,
+    idempotentHint=True, openWorldHint=False,
+)
+
+
+async def _get_template_tool(
+    listing_id: Annotated[str, Field(description="The listing's id (a UUID), e.g. from search_listings.")],
+    ctx: Context | None = None,
+) -> CallToolResult:
+    try:
+        mcp_search_limiter.check_ip(_client_ip(ctx))
+        _validate_listing_id(listing_id)
+        template = await get_template(listing_id)
+    except HTTPException as exc:
+        return _error_result(exc, GET_TEMPLATE_TOOL_NAME)
+    return CallToolResult(content=[TextContent(type="text", text=template.model_dump_json())], isError=False)
+
+
+_get_template_tool.__name__ = GET_TEMPLATE_TOOL_NAME
 
 
 def _allowed_hosts() -> list[str]:
@@ -255,4 +430,13 @@ def create_server() -> FastMCP:
         log_level="WARNING",
     )
     server.add_tool(_search_listings_tool, name=TOOL_NAME, description=TOOL_DESCRIPTION, annotations=_TOOL_ANNOTATIONS)
+    server.add_tool(
+        _get_listing_tool, name=GET_LISTING_TOOL_NAME, description=GET_LISTING_DESCRIPTION, annotations=_GET_LISTING_ANNOTATIONS
+    )
+    server.add_tool(
+        _list_facets_tool, name=LIST_FACETS_TOOL_NAME, description=LIST_FACETS_DESCRIPTION, annotations=_LIST_FACETS_ANNOTATIONS
+    )
+    server.add_tool(
+        _get_template_tool, name=GET_TEMPLATE_TOOL_NAME, description=GET_TEMPLATE_DESCRIPTION, annotations=_GET_TEMPLATE_ANNOTATIONS
+    )
     return server

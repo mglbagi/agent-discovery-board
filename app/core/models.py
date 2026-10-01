@@ -41,6 +41,7 @@ _AMOUNT_RE = re.compile(r"^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$")
 _UNIT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,49}$")
 SUPPORTED_NAMESPACES = ("eip155", "solana")
 MAX_PAYMENT_OPTIONS = 20
+OUTPUT_SCHEMA_MAX_BYTES = 20_000
 
 
 def _reject_control_chars(value: str, field: str) -> str:
@@ -97,6 +98,13 @@ def _validate_address(value: str, field: str) -> str:
     if not _ADDRESS_RE.match(value):
         raise ValueError(f"{field} must be a 0x-prefixed 40-hex-character Ethereum address")
     return value
+
+
+def is_valid_caip2_id(value: str) -> bool:
+    """A syntactically valid CAIP-2 chain id (namespace:reference), e.g. 'eip155:8453' -
+    shape only, not whether it's actually one of SUPPORTED_NAMESPACES (see PaymentOption,
+    which checks both)."""
+    return bool(_CAIP2_RE.match(value))
 
 
 def is_base58_pubkey(value: str) -> bool:
@@ -182,6 +190,22 @@ def _validate_payment_options_not_null(value: list[PaymentOption] | None) -> lis
     return value
 
 
+def _validate_output_schema(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Not deep JSON-Schema validation (this board doesn't try to interpret the schema
+    itself, only store and publish it) - just basic hygiene: a JSON object, not some
+    other JSON type, within a sane size so one listing can't bloat every response that
+    lists it."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("output_schema must be a JSON object")
+    import json
+
+    if len(json.dumps(value)) > OUTPUT_SCHEMA_MAX_BYTES:
+        raise ValueError(f"output_schema must serialize to at most {OUTPUT_SCHEMA_MAX_BYTES} bytes")
+    return value
+
+
 def check_pricing_consistency(
     listing_type: str,
     pricing_model: str | None,
@@ -240,6 +264,12 @@ class ListingCreate(BaseModel):
         description="agent_id to look up on the verification service for this listing's trust-score badge (see "
         "GET /score/{agent_id} on the verification service). Defaults to submitted_by.",
     )
+    output_schema: dict[str, Any] | None = Field(
+        default=None,
+        description="A JSON Schema describing this service's output shape, if it has one - lets another agent "
+        "verify a call's result against it with the sibling verification service's POST /verify/schema (see "
+        "a listing's next_actions). Not validated as a schema itself, just stored and published.",
+    )
     submitted_by: str = Field(description="0x-prefixed Ethereum address of the submitter; who future edits/deletes must be signed by.")
 
     _clean_name = field_validator("name")(lambda v: _reject_control_chars(v, "name"))
@@ -255,6 +285,7 @@ class ListingCreate(BaseModel):
     _clean_agent_id = field_validator("verification_agent_id")(
         lambda v: _reject_control_chars(v, "verification_agent_id") if v is not None else v
     )
+    _clean_output_schema = field_validator("output_schema")(lambda v: _validate_output_schema(v))
 
     @model_validator(mode="after")
     def _pricing(self) -> "ListingCreate":
@@ -280,6 +311,7 @@ class ListingUpdate(BaseModel):
     payment_options: list[PaymentOption] | None = Field(default=None, max_length=MAX_PAYMENT_OPTIONS)
     erc8004_identity: Erc8004Identity | None = None
     verification_agent_id: VerificationAgentId | None = None
+    output_schema: dict[str, Any] | None = None
     status: Status | None = None
 
     _clean_name = field_validator("name")(lambda v: _reject_control_chars(v, "name") if v is not None else v)
@@ -303,6 +335,7 @@ class ListingUpdate(BaseModel):
         lambda v: _reject_control_chars(v, "verification_agent_id") if v is not None else v
     )
     _clean_payment_options = field_validator("payment_options")(_validate_payment_options_not_null)
+    _clean_output_schema = field_validator("output_schema")(lambda v: _validate_output_schema(v))
 
 
 class Badge(BaseModel):
@@ -317,6 +350,23 @@ class Badge(BaseModel):
     reason: str | None
     fetched_at: str
     source: str
+
+
+class ListingNextAction(BaseModel):
+    """How to actually DO something with a listing - distinct from the error NextAction
+    (app/core/errors.py), which is about recovering from a failed API call to THIS
+    board. This is about calling the listed service itself, or verifying its output."""
+
+    action: Literal["call_service", "verify_output"]
+    description: str
+    url: str
+    method: str | None = Field(
+        default=None,
+        description="Best-effort only: this board does not verify a listed service's actual HTTP method. "
+        "Null when unknown.",
+    )
+    price: str | None = Field(default=None, description="A short human-readable price summary, e.g. '$0.05 per_call'.")
+    networks: list[str] = Field(default_factory=list, description="CAIP-2 network ids this can be paid on, if any.")
 
 
 class ListingResponse(BaseModel):
@@ -382,10 +432,36 @@ class ListingResponse(BaseModel):
     last_synced_at: datetime | None = Field(
         default=None, description="When an import last re-synced this listing's content from source. Null if not imported."
     )
+    output_schema: dict[str, Any] | None = Field(
+        default=None,
+        description="A JSON Schema for this service's output, if it has one. See next_actions for how to verify "
+        "against it. has_template (GET /listings filter) matches on whether this is set.",
+    )
+    next_actions: list[ListingNextAction] = Field(
+        default_factory=list,
+        description="How to actually use this listing: always a call_service action (this listing's own "
+        "endpoint_url, price and networks); also a verify_output action when output_schema is set, pointing at "
+        "the sibling verification service's POST /verify/schema.",
+    )
+
+
+class CompactListingResponse(BaseModel):
+    """GET /listings?compact=true: just enough to decide whether a listing is worth a
+    closer look, for an agent scanning many results. Field names match ListingResponse
+    exactly where the same data appears, so an agent switching between modes doesn't
+    need to learn a second vocabulary."""
+
+    id: str
+    name: str
+    endpoint_url: str
+    price: str | None = Field(default=None, description="A short human-readable price summary, e.g. '$0.05 per_call'.")
+    networks: list[str] = Field(default_factory=list, description="CAIP-2 network ids this can be paid on, if any.")
+    task_categories: list[str]
+    claimed: bool
 
 
 class ListingsPage(BaseModel):
-    listings: list[ListingResponse]
+    listings: list[ListingResponse] | list[CompactListingResponse]
     total: int = Field(description="Number of listings matching the filters (not just this page).")
     limit: int
     offset: int = Field(description="Legacy offset paging; prefer cursor.")
@@ -393,6 +469,27 @@ class ListingsPage(BaseModel):
         default=None,
         description="Pass as ?cursor= (or the cursor tool argument) to get the next page; null on the last page.",
     )
+
+
+class FacetCounts(BaseModel):
+    """GET /listings/facets: how many matching listings fall into each value of each
+    facet dimension, for the same filters/q as GET /listings - so an agent can see
+    what's out there before deciding how to narrow a search, instead of paging through
+    everything. Not paginated itself: each dimension is a small, fixed-ish set of
+    values, never one entry per listing."""
+
+    total: int = Field(description="Listings matching the given filters - the same number GET /listings would report.")
+    by_task_category: dict[str, int]
+    by_listing_type: dict[str, int]
+    by_network: dict[str, int] = Field(description="CAIP-2 network id -> count of listings offering payment on it.")
+    by_source: dict[str, int] = Field(
+        description="Import source -> count; organic (non-imported) listings are counted under 'none'."
+    )
+
+
+class TemplateResponse(BaseModel):
+    listing_id: str
+    output_schema: dict[str, Any]
 
 
 class RemovalResponse(BaseModel):

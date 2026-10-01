@@ -82,14 +82,17 @@ async def test_tool_is_discoverable_with_no_payment_mechanics(live_server) -> No
     async with streamablehttp_client(f"{live_server}/mcp/") as (read, write, _), ClientSession(read, write) as session:
         await session.initialize()
         tools = (await session.list_tools()).tools
-        assert [t.name for t in tools] == ["search_listings"]
-        tool = tools[0]
+        assert {t.name for t in tools} == {"search_listings", "get_listing", "list_facets", "get_template"}
+        tool = next(t for t in tools if t.name == "search_listings")
         # No x402/pricing vocabulary anywhere in the tool's own description - unlike
         # the verification service's paid MCP tool, this one must read as free, and
         # say so explicitly rather than just omitting pricing.
         assert "x402" not in tool.description.lower()
         assert "usdc" not in tool.description.lower()
         assert "no payment" in tool.description.lower()
+        for other in tools:
+            if other.name != "search_listings":
+                assert "payment or account required" in other.description.lower()
 
 
 async def test_mcp_results_match_rest_results_for_the_same_filter(live_server) -> None:

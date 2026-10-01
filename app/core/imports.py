@@ -87,6 +87,7 @@ def build_import_row(record: dict[str, Any], *, source: str, now: datetime) -> d
         "payment_options": record.get("payment_options", []),
         "erc8004_identity": record.get("erc8004_identity"),
         "verification_agent_id": record.get("verification_agent_id"),
+        "output_schema": record.get("output_schema"),
         "submitted_by": UNCLAIMED_IMPORT_SUBMITTED_BY,
     }
     try:

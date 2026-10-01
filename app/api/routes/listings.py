@@ -28,15 +28,20 @@ from app.core.constants import DUPLICATE_GUARDED_LISTING_TYPE, TASK_CATEGORIES
 from app.core.errors import ApiError
 from app.core.models import (
     Badge,
+    CompactListingResponse,
     ErrorResponse,
+    FacetCounts,
     HeartbeatResponse,
     ListingCreate,
+    ListingNextAction,
     ListingResponse,
     ListingsPage,
     ListingUpdate,
     RemovalResponse,
     Status,
+    TemplateResponse,
     check_pricing_consistency,
+    is_valid_caip2_id,
 )
 from app.core.pagination import (
     encode_activity_cursor,
@@ -83,6 +88,57 @@ async def _raw_body_dict(request: Request) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _price_summary(row: dict[str, Any]) -> str | None:
+    if row.get("pricing_model") == "free":
+        return "free"
+    if row.get("pricing_amount"):
+        return row["pricing_amount"]
+    for po in row.get("payment_options") or []:
+        amount, unit = po.get("amount"), po.get("unit")
+        if amount is not None:
+            return f"{amount} {unit}" if unit else str(amount)
+    return None
+
+
+def _networks(row: dict[str, Any]) -> list[str]:
+    return [po["network"] for po in row.get("payment_options") or []]
+
+
+def _next_actions(row: dict[str, Any]) -> list[ListingNextAction]:
+    """How to actually use this listing (see ListingNextAction) - always a call_service
+    action, plus a verify_output action when the listing carries an output_schema."""
+    from app.core.score_client import VERIFICATION_SERVICE_URL
+
+    price, networks = _price_summary(row), _networks(row)
+    actions = [
+        ListingNextAction(
+            action="call_service",
+            description="Call this service's endpoint directly. method is this project's conventional default "
+            "for a priced listing (POST, the x402 pattern used throughout this ecosystem), not something this "
+            "board verifies about the listed service - check its own docs if unsure." if row.get("pricing_model")
+            else "Call this service's endpoint directly; this board does not know or verify its HTTP method.",
+            url=row["endpoint_url"],
+            method="POST" if row.get("pricing_model") else None,
+            price=price,
+            networks=networks,
+        )
+    ]
+    if row.get("output_schema") is not None:
+        actions.append(
+            ListingNextAction(
+                action="verify_output",
+                description="POST {\"output\": <this service's actual output>, \"schema\": <this listing's "
+                "output_schema>} to the sibling verification service's /verify/schema to check the two match. "
+                "See that service's own docs for its exact body shape, response and pricing.",
+                url=f"{VERIFICATION_SERVICE_URL}/verify/schema",
+                method="POST",
+                price=None,
+                networks=[],
+            )
+        )
+    return actions
+
+
 async def _to_response(row: dict[str, Any]) -> ListingResponse:
     # Test listings never cost a trust-score lookup.
     if row["is_test"]:
@@ -96,6 +152,19 @@ async def _to_response(row: dict[str, Any]) -> ListingResponse:
         last_activity_at=last_activity_at(row),
         stale=is_stale(row),
         badge=Badge(**raw_badge) if raw_badge is not None else None,
+        next_actions=_next_actions(row),
+    )
+
+
+def _to_compact_response(row: dict[str, Any]) -> CompactListingResponse:
+    return CompactListingResponse(
+        id=row["id"],
+        name=row["name"],
+        endpoint_url=row["endpoint_url"],
+        price=_price_summary(row),
+        networks=_networks(row),
+        task_categories=row["task_categories"],
+        claimed=row["claimed"],
     )
 
 
@@ -118,6 +187,12 @@ MAX_LISTING_TYPE_FILTER_LENGTH = 50
 MAX_CURSOR_LENGTH = 512
 
 
+def _validate_payment_network(value: str | None) -> str | None:
+    if value is not None and not is_valid_caip2_id(value):
+        raise ApiError(422, "validation_error", f"payment_network {value!r} is not a CAIP-2 chain id (namespace:reference)")
+    return value
+
+
 async def search_listings(
     *,
     listing_type: str | None = None,
@@ -129,6 +204,11 @@ async def search_listings(
     cursor: str | None = None,
     include_test: bool = False,
     claimed: bool | None = None,
+    payment_network: str | None = None,
+    max_price: float | None = None,
+    has_template: bool | None = None,
+    stale: bool | None = None,
+    compact: bool = False,
 ) -> ListingsPage:
     """The single place that actually searches/filters listings and attaches trust
     badges. Both `GET /listings` below and the `search_listings` MCP tool
@@ -149,7 +229,17 @@ async def search_listings(
     the cheap places that opportunistically purges expired test listings (throttled).
 
     `claimed`: omitted applies no filter; true/false restrict to claimed or unclaimed
-    (imported, not yet claimed - see app/core/imports.py) listings.
+    (imported, not yet claimed - see app/core/imports.py) listings. `payment_network`/
+    `max_price`: a single payment_option must satisfy both together when both are given.
+    `max_price` is a USD amount; it only ever matches a payment_option in a recognized
+    USD stablecoin (app/core/stablecoins.py - currently USDC on Base/Ethereum/Solana),
+    since that's the only asset type this board can compare to a dollar figure without a
+    price oracle - a listing priced only in ETH, SOL or another token is excluded from
+    max_price entirely, not guessed at. `has_template`: output_schema is/isn't set.
+    `stale`: mirrors the `stale` response field exactly. `compact`: return
+    CompactListingResponse items (id, name, endpoint_url, price, networks,
+    task_categories, claimed) instead of the full shape - cheaper (no badge lookups) for
+    an agent just scanning many results.
     """
     await asyncio.to_thread(maintenance.maybe_purge)
     if listing_type is not None and len(listing_type) > MAX_LISTING_TYPE_FILTER_LENGTH:
@@ -166,6 +256,9 @@ async def search_listings(
         raise ApiError(422, "invalid_pagination", "cursor and offset cannot be combined; use only the cursor.")
     if cursor is not None and len(cursor) > MAX_CURSOR_LENGTH:
         raise ApiError(422, "invalid_cursor", "cursor is not a valid cursor returned by this service.")
+    if max_price is not None and max_price < 0:
+        raise ApiError(422, "validation_error", "max_price must be >= 0")
+    payment_network = _validate_payment_network(payment_network)
 
     categories = _validate_task_category_filter(task_category)
     decoded = resolve_cursor(cursor, q)
@@ -180,6 +273,10 @@ async def search_listings(
         cursor=decoded,
         include_test=include_test,
         claimed=claimed,
+        payment_network=payment_network,
+        max_price=max_price,
+        has_template=has_template,
+        stale=stale,
     )
 
     next_cursor = None
@@ -194,8 +291,11 @@ async def search_listings(
     for row in rows:
         row.pop("_cursor_value", None)
 
-    listings = await asyncio.gather(*(_to_response(row) for row in rows))
-    return ListingsPage(listings=list(listings), total=total, limit=limit, offset=offset, next_cursor=next_cursor)
+    if compact:
+        listings = [_to_compact_response(row) for row in rows]
+    else:
+        listings = list(await asyncio.gather(*(_to_response(row) for row in rows)))
+    return ListingsPage(listings=listings, total=total, limit=limit, offset=offset, next_cursor=next_cursor)
 
 
 def _duplicate_error(existing_id: str, is_test: bool = False) -> ApiError:
@@ -294,6 +394,29 @@ async def browse_listings(
         description="Filter by claim status (see the `claimed` response field): true for claimed listings only, "
         "false for unclaimed imports only, omitted for no filter.",
     ),
+    payment_network: str | None = Query(
+        default=None, description="CAIP-2 chain id, e.g. 'eip155:8453'. Only listings payable on this network."
+    ),
+    max_price: float | None = Query(
+        default=None, ge=0,
+        description="A USD amount. Only matches a payment_option in a recognized USD stablecoin (currently "
+        "USDC on Base/Ethereum/Solana - see the manifest's imports/search docs); listings priced only in a "
+        "non-stablecoin asset (ETH, SOL, etc.) are excluded, not guessed at, since this board has no price "
+        "oracle. Combined with payment_network, both must be satisfied by the same payment_option.",
+    ),
+    has_template: bool | None = Query(
+        default=None, description="Filter by whether output_schema is set: true for listings with a declared "
+        "output template, false for those without, omitted for no filter."
+    ),
+    stale: bool | None = Query(
+        default=None, description="Filter by the `stale` response field (no activity past the threshold, or "
+        "missing from its last import sync)."
+    ),
+    compact: bool = Query(
+        default=False,
+        description="Return CompactListingResponse items (id, name, endpoint_url, price, networks, "
+        "task_categories, claimed) instead of the full shape - cheaper for scanning many results.",
+    ),
 ) -> ListingsPage:
     return await search_listings(
         listing_type=listing_type,
@@ -305,7 +428,80 @@ async def browse_listings(
         cursor=cursor,
         include_test=include_test,
         claimed=claimed,
+        payment_network=payment_network,
+        max_price=max_price,
+        has_template=has_template,
+        stale=stale,
+        compact=compact,
     )
+
+
+@router.get("/listings/facets", response_model=FacetCounts, responses=_errors(422, 429))
+async def facets(
+    listing_type: str | None = Query(default=None, max_length=MAX_LISTING_TYPE_FILTER_LENGTH),
+    task_category: list[str] | None = Query(default=None, alias="task_category"),
+    q: str | None = Query(default=None, max_length=MAX_SEARCH_Q_LENGTH),
+    status: Status | None = Query(default=None),
+    include_test: bool = Query(default=False),
+    claimed: bool | None = Query(default=None),
+    payment_network: str | None = Query(default=None),
+    max_price: float | None = Query(
+        default=None, ge=0, description="A USD amount; see the same parameter on GET /listings."
+    ),
+    has_template: bool | None = Query(default=None),
+    stale: bool | None = Query(default=None),
+) -> FacetCounts:
+    """Counts of matching listings per task_category, listing_type, payment network and
+    import source - the same filters (including q) as GET /listings, so an agent can see
+    what's out there before deciding how to narrow a search instead of paging through
+    everything. Not paginated: a small, mostly-fixed number of buckets per dimension."""
+    return await list_facets(
+        listing_type=listing_type, task_category=task_category, q=q, status=status, include_test=include_test,
+        claimed=claimed, payment_network=payment_network, max_price=max_price, has_template=has_template, stale=stale,
+    )
+
+
+async def list_facets(
+    *,
+    listing_type: str | None = None,
+    task_category: list[str] | None = None,
+    q: str | None = None,
+    status: str | None = None,
+    include_test: bool = False,
+    claimed: bool | None = None,
+    payment_network: str | None = None,
+    max_price: float | None = None,
+    has_template: bool | None = None,
+    stale: bool | None = None,
+) -> FacetCounts:
+    """Shared by GET /listings/facets and the list_facets MCP tool - same validation and
+    filters as search_listings above, minus pagination (facets are never paginated)."""
+    await asyncio.to_thread(maintenance.maybe_purge)
+    if listing_type is not None and len(listing_type) > MAX_LISTING_TYPE_FILTER_LENGTH:
+        raise ApiError(422, "validation_error", f"listing_type must be at most {MAX_LISTING_TYPE_FILTER_LENGTH} characters")
+    if q is not None and len(q) > MAX_SEARCH_Q_LENGTH:
+        raise ApiError(422, "validation_error", f"q must be at most {MAX_SEARCH_Q_LENGTH} characters")
+    if status is not None and status not in ("active", "inactive"):
+        raise ApiError(422, "validation_error", f"status must be 'active' or 'inactive', got {status!r}")
+    if max_price is not None and max_price < 0:
+        raise ApiError(422, "validation_error", "max_price must be >= 0")
+    payment_network = _validate_payment_network(payment_network)
+    categories = _validate_task_category_filter(task_category)
+
+    counts = await asyncio.to_thread(
+        db.facet_counts,
+        listing_type=listing_type,
+        task_categories=categories,
+        q=q,
+        status=status,
+        include_test=include_test,
+        claimed=claimed,
+        payment_network=payment_network,
+        max_price=max_price,
+        has_template=has_template,
+        stale=stale,
+    )
+    return FacetCounts(**counts)
 
 
 @router.get("/listings/{listing_id}", response_model=ListingResponse, responses=_errors(404))
@@ -314,6 +510,23 @@ async def get_listing(listing_id: ListingIdPath) -> ListingResponse:
     if row is None:
         raise ApiError(404, "not_found", "No listing with this id.")
     return await _to_response(row)
+
+
+@router.get(
+    "/listings/{listing_id}/template",
+    response_model=TemplateResponse,
+    responses=_errors(404),
+)
+async def get_template(listing_id: ListingIdPath) -> TemplateResponse:
+    """The output_schema a listing has declared (see ListingNextAction's verify_output),
+    most useful for a verification_profile listing but available on any listing that has
+    one. 404 no_template if the listing has none set, or not_found if it doesn't exist."""
+    row = await asyncio.to_thread(db.get_listing, listing_id)
+    if row is None:
+        raise ApiError(404, "not_found", "No listing with this id.")
+    if row.get("output_schema") is None:
+        raise ApiError(404, "no_template", "This listing has no output_schema set.")
+    return TemplateResponse(listing_id=listing_id, output_schema=row["output_schema"])
 
 
 @router.patch(

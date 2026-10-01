@@ -23,16 +23,25 @@ from app.core.errors import SIGNATURE_HEADER_FIELD, error_codes_manifest
 from app.core.reserved import RESERVED_ADDRESSES
 from app.core.imports import DEFAULT_IMPORT_LISTING_TYPE
 from app.core.models import (
+    CompactListingResponse,
     ErrorResponse,
+    FacetCounts,
     HeartbeatResponse,
     ListingCreate,
+    ListingNextAction,
     ListingResponse,
     ListingsPage,
     PaymentOption,
     RemovalResponse,
 )
 from app.core.signing_spec import signing_spec
-from app.mcp_server import MCP_PATH
+from app.core.stablecoins import stablecoin_pairs
+from app.mcp_server import (
+    GET_LISTING_TOOL_NAME,
+    GET_TEMPLATE_TOOL_NAME,
+    LIST_FACETS_TOOL_NAME,
+    MCP_PATH,
+)
 from app.mcp_server import TOOL_NAME as MCP_TOOL_NAME
 
 router = APIRouter()
@@ -103,9 +112,28 @@ def _build_listings_extension() -> dict[str, Any]:
                         "offset (legacy)",
                         "include_test",
                         "claimed",
+                        "payment_network",
+                        "max_price",
+                        "has_template",
+                        "stale",
+                        "compact",
                     ],
                 },
+                "facets": {
+                    "method": "GET",
+                    "url": f"{LISTINGS_URL}/facets",
+                    "auth": "none",
+                    "description": "Counts per task_category/listing_type/network/source for the same filters "
+                    "(including q) as browse, above - not paginated. See params.facets.",
+                },
                 "get": {"method": "GET", "url": f"{LISTINGS_URL}/{{id}}", "auth": "none"},
+                "getTemplate": {
+                    "method": "GET",
+                    "url": f"{LISTINGS_URL}/{{id}}/template",
+                    "auth": "none",
+                    "description": "A listing's output_schema. 404 no_template if unset. See params.imports / "
+                    "ListingResponse.next_actions.",
+                },
                 "update": {"method": "PATCH", "url": f"{LISTINGS_URL}/{{id}}", "auth": "wallet-signature"},
                 "deactivate": {"method": "DELETE", "url": f"{LISTINGS_URL}/{{id}}", "auth": "wallet-signature"},
                 "heartbeat": {
@@ -163,6 +191,40 @@ def _build_listings_extension() -> dict[str, Any]:
                 "are weighted above task_categories matches.",
                 "fallback": "a typo or partial word that full-text matches nothing for automatically falls back "
                 "to a fuzzy (trigram) match against name and description.",
+                "structuredFilters": "listing_type, task_category, claimed, payment_network, max_price, "
+                "has_template and stale all combine with q and with each other (AND). payment_network is a "
+                "CAIP-2 chain id. max_price is a USD amount: a payment_option's own amount is in that asset's "
+                "whole-token units, directly comparable to USD only for a recognized USD stablecoin (~1 token = "
+                "$1 - see stablecoins below), so max_price only ever matches a stablecoin payment_option; a "
+                "listing priced only in a non-stablecoin asset (ETH, SOL, etc.) is excluded from max_price "
+                "entirely, never guessed at, since this board has no price oracle. When payment_network and "
+                "max_price are both given, one payment_option must satisfy both together.",
+                "stablecoins": {
+                    "description": "The complete, manually-curated list of (network, asset) pairs max_price "
+                    "treats as pegged ~1:1 to the US dollar (app/core/stablecoins.py) - not a general price "
+                    "registry, just what this board's own listings actually use today.",
+                    "pairs": [{"network": network, "asset": asset} for network, asset in stablecoin_pairs()],
+                },
+                "compact": "pass compact=true to GET /listings or search_listings for a reduced shape (id, name, "
+                "endpoint_url, price, networks, task_categories, claimed) instead of the full one - see "
+                "compactSchema. Cheaper: skips trust-score badge lookups entirely.",
+            },
+            "facets": {
+                "description": "GET /listings/facets (and the list_facets MCP tool) take the same filters as "
+                "browse/search_listings, including q, and return counts per task_category, listing_type, "
+                "payment network and import source among the matching listings - so an agent can see what's out "
+                "there before deciding how to narrow a search, instead of paging through everything. Not "
+                "paginated itself: a small, mostly-fixed number of buckets per dimension.",
+                "responseSchema": FacetCounts.model_json_schema(),
+            },
+            "nextActions": {
+                "description": "Every listing's next_actions says how to actually use it: a call_service entry "
+                "(this listing's own endpoint_url, a best-effort method, price and networks - the board does not "
+                "verify a listed service's actual HTTP method), and, when output_schema is set, a verify_output "
+                "entry pointing at the sibling verification service's POST /verify/schema. Distinct from the "
+                "error next_actions (params.errors.nextActionsConvention), which are about recovering from a "
+                "failed call to THIS board.",
+                "schema": ListingNextAction.model_json_schema(),
             },
             "paymentOptions": {
                 "description": "Optional structured payment methods on a listing, one per network/asset. Preferred "
@@ -228,6 +290,11 @@ def _build_listings_extension() -> dict[str, Any]:
                 "threshold; it un-marks itself if a later sync finds it again.",
                 "contentPreservedAfterClaim": "once claimed, a re-sync only refreshes last_synced_at and never "
                 "overwrites the listing's content, name, pricing or anything else the owner may have edited.",
+                "outputSchema": "A listing - imported or not, most relevantly a verification_profile - can carry "
+                "an output_schema (a JSON Schema for its output), published read-only via GET "
+                "/listings/{id}/template and the get_template tool, and surfaced in next_actions as a "
+                "verify_output entry pointing at the sibling verification service's POST /verify/schema. "
+                "has_template filters GET /listings by whether it's set. 404 no_template if it isn't.",
             },
             "deprecatedFields": {"payment_wallet": "Use payment_options. Still required and still returned."},
             "errors": {
@@ -261,6 +328,7 @@ def _build_listings_extension() -> dict[str, Any]:
             },
             "inputSchema": ListingCreate.model_json_schema(),
             "outputSchema": ListingResponse.model_json_schema(),
+            "compactSchema": CompactListingResponse.model_json_schema(),
             "listSchema": ListingsPage.model_json_schema(),
             "heartbeatSchema": HeartbeatResponse.model_json_schema(),
             "example": _EXAMPLE_LISTING_CREATE,
@@ -272,17 +340,23 @@ def _build_mcp_extension() -> dict[str, Any]:
     return {
         "uri": MCP_EXTENSION_URI,
         "description": (
-            "The same search/browse behavior as GET /listings is also available as a "
-            "Model Context Protocol (MCP) tool over Streamable HTTP, alongside the REST "
-            "endpoint - not replacing it. Free, no payment, no account. Submitting, "
-            "editing, or deactivating a listing is REST-only; there is no MCP tool for "
-            "those."
+            "The same search/browse/facets/template behavior as the REST API is also "
+            "available as four Model Context Protocol (MCP) tools over Streamable HTTP, "
+            "alongside the REST endpoints - not replacing them. Free, no payment, no "
+            "account. Submitting, editing, or deactivating a listing is REST-only; there "
+            "is no MCP tool for those."
         ),
         "required": False,
         "params": {
             "transport": "streamable-http",
             "url": f"{SERVICE_BASE_URL}{MCP_PATH}",
-            "toolName": MCP_TOOL_NAME,
+            "toolName": MCP_TOOL_NAME,  # kept for backward compatibility; see toolNames for all four
+            "toolNames": {
+                "search": MCP_TOOL_NAME,
+                "getListing": GET_LISTING_TOOL_NAME,
+                "listFacets": LIST_FACETS_TOOL_NAME,
+                "getTemplate": GET_TEMPLATE_TOOL_NAME,
+            },
             "access": {"payment": "none", "rateLimited": True},
         },
     }
