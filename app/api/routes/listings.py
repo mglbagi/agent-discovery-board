@@ -41,6 +41,7 @@ from app.core.models import (
     Status,
     TemplateResponse,
     check_pricing_consistency,
+    is_evm_address,
     is_valid_caip2_id,
 )
 from app.core.pagination import (
@@ -124,16 +125,31 @@ def _next_actions(row: dict[str, Any]) -> list[ListingNextAction]:
         )
     ]
     if row.get("output_schema") is not None:
+        verification = row.get("verification") or {}
+        body = {"output": "<fill in with this service's actual output>", "schema": row["output_schema"]}
+        if verification.get("rules"):
+            body["rules"] = verification["rules"]
+        if verification.get("bounds"):
+            body["bounds"] = verification["bounds"]
+        if verification.get("enforce_rules"):
+            body["enforce_rules"] = True
+        description = "POST this body to the sibling verification service's /verify/schema to check the "
+        description += (
+            "output against the schema AND run its cross-field rules/bounds (enforce_rules: true), not just the "
+            "schema. "
+            if "rules" in body or "bounds" in body or "enforce_rules" in body
+            else "output against the schema. "
+        )
+        description += "See that service's own docs for its exact response shape and pricing."
         actions.append(
             ListingNextAction(
                 action="verify_output",
-                description="POST {\"output\": <this service's actual output>, \"schema\": <this listing's "
-                "output_schema>} to the sibling verification service's /verify/schema to check the two match. "
-                "See that service's own docs for its exact body shape, response and pricing.",
+                description=description,
                 url=f"{VERIFICATION_SERVICE_URL}/verify/schema",
                 method="POST",
                 price=None,
                 networks=[],
+                body=body,
             )
         )
     return actions
@@ -518,15 +534,23 @@ async def get_listing(listing_id: ListingIdPath) -> ListingResponse:
     responses=_errors(404),
 )
 async def get_template(listing_id: ListingIdPath) -> TemplateResponse:
-    """The output_schema a listing has declared (see ListingNextAction's verify_output),
-    most useful for a verification_profile listing but available on any listing that has
-    one. 404 no_template if the listing has none set, or not_found if it doesn't exist."""
+    """The full verification template a listing has declared: its output_schema, plus
+    verification (rules/bounds/enforce_rules) and template_url when set - see
+    ListingNextAction's verify_output, which carries the same rules/bounds into its
+    suggested body. Most useful for a verification_profile listing but available on any
+    listing that has one. 404 no_template if the listing has no output_schema (the
+    required part of a template), or not_found if it doesn't exist."""
     row = await asyncio.to_thread(db.get_listing, listing_id)
     if row is None:
         raise ApiError(404, "not_found", "No listing with this id.")
     if row.get("output_schema") is None:
         raise ApiError(404, "no_template", "This listing has no output_schema set.")
-    return TemplateResponse(listing_id=listing_id, output_schema=row["output_schema"])
+    return TemplateResponse(
+        listing_id=listing_id,
+        output_schema=row["output_schema"],
+        verification=row.get("verification"),
+        template_url=row.get("template_url"),
+    )
 
 
 @router.patch(
@@ -637,6 +661,12 @@ async def claim_listing(listing_id: ListingIdPath, request: Request) -> ListingR
         raise ApiError(404, "not_found", "No listing with this id.")
     if existing["claimed"]:
         raise ApiError(409, "already_claimed", "This listing has already been claimed.")
+    if not is_evm_address(existing["payment_wallet"]):
+        raise ApiError(
+            422,
+            "unclaimable_payment_wallet",
+            "This listing's payment_wallet is not an EVM address; claiming is EVM-only for now.",
+        )
 
     verify_wallet_auth(
         request,
@@ -671,6 +701,12 @@ async def remove_imported_listing(listing_id: ListingIdPath, request: Request) -
         raise ApiError(404, "not_found", "No listing with this id.")
     if existing["source"] is None:
         raise ApiError(422, "not_imported", "This listing was not imported; use the normal signed DELETE instead.")
+    if not is_evm_address(existing["payment_wallet"]):
+        raise ApiError(
+            422,
+            "unclaimable_payment_wallet",
+            "This listing's payment_wallet is not an EVM address; self-service removal is EVM-only for now.",
+        )
 
     verify_wallet_auth(
         request,

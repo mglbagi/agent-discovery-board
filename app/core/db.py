@@ -268,6 +268,11 @@ def _ensure_schema() -> None:
             # A JSON Schema for this service's output, if it has one (has_template filter and
             # a listing's verify_output next_action - see app/api/routes/listings.py).
             conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS output_schema JSONB")
+            # Cross-field rules/bounds/enforce_rules to check alongside output_schema, and a
+            # link to a fuller template hosted elsewhere - both optional, both just stored
+            # and published verbatim (see app/core/models.py's lenient validators).
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS verification JSONB")
+            conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS template_url TEXT")
         _schema_ready = True
 
 
@@ -298,7 +303,7 @@ _COLUMNS = (
     "payment_wallet", "pricing_model", "pricing_amount", "payment_options", "erc8004_identity",
     "verification_agent_id", "submitted_by", "status", "is_test", "created_at", "updated_at", "last_seen_at",
     "claimed", "source", "source_url", "imported_at", "last_synced_at", "missing_from_source_since",
-    "output_schema",
+    "output_schema", "verification", "template_url",
 )
 # last_seen_at is only ever set by heartbeat; missing_from_source_since only by a sync noticing
 # a listing is gone. Every create_listing() caller supplies the rest, including the import path.
@@ -312,6 +317,8 @@ def _prepare(params: dict[str, Any]) -> dict[str, Any]:
         out["payment_options"] = Jsonb(out["payment_options"] or [])
     if "output_schema" in out and out["output_schema"] is not None:
         out["output_schema"] = Jsonb(out["output_schema"])
+    if "verification" in out and out["verification"] is not None:
+        out["verification"] = Jsonb(out["verification"])
     return out
 
 
@@ -320,7 +327,7 @@ def _prepare(params: dict[str, Any]) -> dict[str, Any]:
 # The import path (app/core/imports.py's build_import_row) always sets these explicitly.
 _CREATE_DEFAULTS = {
     "claimed": True, "source": None, "source_url": None, "imported_at": None, "last_synced_at": None,
-    "output_schema": None,
+    "output_schema": None, "verification": None, "template_url": None,
 }
 
 
@@ -770,6 +777,20 @@ def is_in_do_not_import(source: str, endpoint_url: str) -> bool:
     return row is not None
 
 
+def do_not_import_keys(source: str, endpoint_urls: list[str]) -> set[str]:
+    """Which of these endpoint_urls (for `source`) are on the do-not-import list,
+    normalized - one query instead of one per record, for a bulk import script
+    checking thousands of records at once."""
+    if not endpoint_urls:
+        return set()
+    keys = [normalize_endpoint_url(u) for u in endpoint_urls]
+    with _connection() as conn:
+        rows = conn.execute(
+            "SELECT endpoint_key FROM do_not_import WHERE source = %s AND endpoint_key = ANY(%s)", (source, keys)
+        ).fetchall()
+    return {r["endpoint_key"] for r in rows}
+
+
 #  Content columns a re-sync may refresh from source - but only while the listing is
 # still unclaimed. Once claimed, the owner may have edited any of these by hand (a
 # signed PATCH), and a later sync must not silently overwrite that; only the freshness
@@ -780,7 +801,7 @@ def is_in_do_not_import(source: str, endpoint_url: str) -> bool:
 _IMPORT_REFRESHABLE_COLUMNS = (
     "name", "description", "listing_type", "task_categories", "endpoint_url", "payment_wallet",
     "pricing_model", "pricing_amount", "payment_options", "erc8004_identity", "verification_agent_id",
-    "source_url", "output_schema",
+    "source_url", "output_schema", "verification", "template_url",
 )
 
 

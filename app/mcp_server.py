@@ -365,12 +365,13 @@ async def _list_facets_tool(
 _list_facets_tool.__name__ = LIST_FACETS_TOOL_NAME
 
 GET_TEMPLATE_DESCRIPTION = (
-    "The output_schema a listing has declared (most useful for a verification_profile "
-    "listing, but available on any listing that has one) - use it with the sibling "
-    "verification service's POST /verify/schema to check a call's actual output against "
-    "it (see that listing's next_actions for the exact shape). 404 no_template if the "
-    "listing has none set, not_found if the id does not exist. Free, no payment or "
-    "account required."
+    "A listing's full verification template (most useful for a verification_profile "
+    "listing, but available on any listing that has one): output_schema, plus "
+    "verification (optional cross-field rules/bounds/enforce_rules) and template_url "
+    "when set - use it with the sibling verification service's POST /verify/schema to "
+    "check a call's actual output against it (see that listing's next_actions for the "
+    "exact suggested body). 404 no_template if the listing has no output_schema, "
+    "not_found if the id does not exist. Free, no payment or account required."
 )
 _GET_TEMPLATE_ANNOTATIONS = ToolAnnotations(
     title="Get a listing's output template", readOnlyHint=True, destructiveHint=False,

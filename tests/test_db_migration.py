@@ -198,6 +198,20 @@ def test_a_legacy_table_gets_the_imports_schema_and_existing_rows_are_claimed(le
     assert row == (True, None, None, None, None)
 
 
+def test_a_legacy_table_gets_the_verification_template_columns(legacy_table) -> None:
+    listing_id = _insert_legacy(legacy_table, "https://template-migration.example.com/agent")
+    db.init_db()
+
+    columns = {r[0] for r in legacy_table.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name = 'listings'"
+    ).fetchall()}
+    assert {"output_schema", "verification", "template_url"} <= columns
+    row = legacy_table.execute(
+        "SELECT output_schema, verification, template_url FROM listings WHERE id = %s", (listing_id,)
+    ).fetchone()
+    assert row == (None, None, None)
+
+
 def test_the_previous_versions_duplicate_index_is_replaced_by_the_scoped_one(legacy_table) -> None:
     legacy_table.execute("ALTER TABLE listings ADD COLUMN endpoint_key TEXT")
     legacy_table.execute(

@@ -464,10 +464,13 @@ written into it — required, no silent localhost fallback (see `.env.example`).
 
 - **Claiming an imported listing only supports an EVM (eip155) `payment_wallet`.**
   `POST /listings/{id}/claim` and `/remove-imported` are EIP-191 `personal_sign`
-  signatures (`app/core/wallet_auth.py`), verified with `eth_account`. An imported
-  listing whose pay-to address is Solana (ed25519) or an EVM smart-contract wallet
-  (ERC-1271) cannot currently be claimed or self-removed — there is no signature
-  scheme wired up for either yet. Not started.
+  signatures (`app/core/wallet_auth.py`), verified with `eth_account`. `payment_wallet`
+  itself accepts a Solana address (a seller without an EVM pay-to isn't excluded from
+  the board), but a listing whose *only* pay-to is Solana (ed25519) or an EVM
+  smart-contract wallet (ERC-1271) cannot currently be claimed or self-removed — both
+  routes return `422 unclaimable_payment_wallet` rather than attempt a signature check
+  that could never succeed. There is no signature scheme wired up for either yet. Not
+  started.
 
 ## Independence from the verification service
 

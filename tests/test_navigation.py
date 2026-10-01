@@ -234,6 +234,30 @@ def test_output_schema_adds_a_verify_output_next_action() -> None:
     verify = actions["verify_output"]
     assert verify["url"] == f"{VERIFICATION_SERVICE_URL}/verify/schema"
     assert verify["method"] == "POST"
+    assert verify["body"]["schema"] == listing["output_schema"]
+    assert "rules" not in verify["body"] and "enforce_rules" not in verify["body"]  # no verification set
+
+
+def test_verification_folds_rules_and_enforce_rules_into_the_verify_output_body() -> None:
+    schema = {"type": "object"}
+    verification = {
+        "rules": [{"type": "unique", "field": "items[].id"}],
+        "bounds": {"total": {"min": 0}},
+        "enforce_rules": True,
+    }
+    listing = _create(_marker(), output_schema=schema, verification=verification)
+    verify = next(a for a in listing["next_actions"] if a["action"] == "verify_output")
+    assert verify["body"]["schema"] == schema
+    assert verify["body"]["rules"] == verification["rules"]
+    assert verify["body"]["bounds"] == verification["bounds"]
+    assert verify["body"]["enforce_rules"] is True
+    assert "run its cross-field rules" in verify["description"].lower() or "not just the schema" in verify["description"].lower()
+
+
+def test_verification_without_output_schema_does_not_add_a_next_action() -> None:
+    # verification only makes sense alongside output_schema (what are the rules checking?).
+    listing = _create(_marker(), verification={"rules": [], "bounds": {}, "enforce_rules": True})
+    assert not any(a["action"] == "verify_output" for a in listing["next_actions"])
 
 
 # ---- output_schema: creation, validation, patching -----------------------------------------
@@ -259,6 +283,25 @@ def test_output_schema_oversized_is_rejected() -> None:
     payload = listing_payload("offering", owner.address, output_schema=huge)
     response = client.post("/listings", json=payload)
     assert response.status_code == 422
+
+
+def test_verification_round_trips_and_must_be_a_json_object() -> None:
+    verification = {"rules": [{"type": "unique", "field": "a"}], "bounds": {}, "enforce_rules": False}
+    listing = _create(_marker(), verification=verification)
+    assert listing["verification"] == verification
+
+    owner = Account.create()
+    bad = listing_payload("offering", owner.address, verification=["not", "an", "object"])
+    assert client.post("/listings", json=bad).status_code == 422
+
+
+def test_template_url_round_trips_and_must_be_http_or_https() -> None:
+    listing = _create(_marker(), template_url="https://example.com/templates/t.json")
+    assert listing["template_url"] == "https://example.com/templates/t.json"
+
+    owner = Account.create()
+    bad = listing_payload("offering", owner.address, template_url="ftp://example.com/t.json")
+    assert client.post("/listings", json=bad).status_code == 422
 
 
 def test_output_schema_can_be_set_and_cleared_via_patch() -> None:
@@ -287,7 +330,20 @@ def test_get_template_returns_the_schema() -> None:
     listing = _create(_marker(), output_schema=schema)
     response = client.get(f"/listings/{listing['id']}/template")
     assert response.status_code == 200
-    assert response.json() == {"listing_id": listing["id"], "output_schema": schema}
+    assert response.json() == {
+        "listing_id": listing["id"], "output_schema": schema, "verification": None, "template_url": None,
+    }
+
+
+def test_get_template_includes_verification_and_template_url_when_set() -> None:
+    schema = {"type": "object"}
+    verification = {"rules": [{"type": "unique", "field": "items[].id"}], "bounds": {"total": {"min": 0}}, "enforce_rules": True}
+    listing = _create(
+        _marker(), output_schema=schema, verification=verification, template_url="https://example.com/t.json"
+    )
+    response = client.get(f"/listings/{listing['id']}/template").json()
+    assert response["verification"] == verification
+    assert response["template_url"] == "https://example.com/t.json"
 
 
 def test_get_template_404s_with_no_template() -> None:

@@ -96,23 +96,28 @@ def test_apply_inserts_new_unclaimed_listings_and_logs(run) -> None:
 # ---- validation: one bad record aborts the whole batch --------------------------------------
 
 
-def test_an_invalid_record_aborts_the_whole_batch(run) -> None:
+def test_an_invalid_record_is_rejected_and_reported_but_does_not_block_the_rest(run) -> None:
     good = _record()
     bad = _record(name="")  # empty name fails ListingCreate validation
     code, out, err = run([good, bad], "--source", _source(), "--apply", "--yes")
-    assert code != 0
-    assert "invalid" in err.lower()
+    assert code == 0, err
+    assert "1 record(s) valid, 1 rejected" in out
+    assert "Inserted 1, updated 0" in out
     # Not "q=good['name'], total==0": the trigram fallback can fuzzy-match an unrelated
     # listing sharing the "Imported Agent" prefix from another test in this shared
     # database. Checking by the (unique, random) endpoint_url is precise either way.
     page = client.get("/listings", params={"listing_type": "verification_profile", "limit": 100}).json()
-    assert not any(item["endpoint_url"] == good["endpoint_url"] for item in page["listings"])
+    assert any(item["endpoint_url"] == good["endpoint_url"] for item in page["listings"])
 
 
-def test_a_non_object_record_aborts_cleanly(run) -> None:
-    code, out, err = run(["not an object"], "--source", _source())
-    assert code != 0
-    assert "expected an object" in err
+def test_a_non_object_record_is_rejected_and_reported(run) -> None:
+    good = _record()
+    code, out, err = run([good, "not an object"], "--source", _source(), "--apply", "--yes")
+    assert code == 0, err
+    assert "1 record(s) valid, 1 rejected" in out
+    assert "expected an object" in out
+    page = client.get("/listings", params={"listing_type": "verification_profile", "limit": 100}).json()
+    assert any(item["endpoint_url"] == good["endpoint_url"] for item in page["listings"])
 
 
 # ---- re-sync: update in place, never duplicate -----------------------------------------------
@@ -241,3 +246,100 @@ def test_retyping_the_source_confirms(run, monkeypatch) -> None:
     monkeypatch.setattr("builtins.input", lambda prompt="": source)
     code, out, err = run([_record()], "--source", source, "--apply")
     assert code == 0, err
+
+
+# ---- per-record source, .jsonl, verification/template_url, Solana fallback -------------------
+
+
+def test_source_can_come_from_each_record_instead_of_the_cli_flag(run) -> None:
+    source = _source()
+    record = _record(_import={"source": source, "category": "other"})
+    code, out, err = run([record], "--apply", "--yes")  # no --source at all
+    assert code == 0, err
+    assert "Source: (from each record)" in out
+    listing = client.get(
+        "/listings", params={"listing_type": "verification_profile", "q": record["name"]}
+    ).json()["listings"][0]
+    assert listing["source"] == source
+
+
+def test_jsonl_input_is_accepted(run, tmp_path) -> None:
+    source = _source()
+    record = _record()
+    path = tmp_path / "records.jsonl"
+    path.write_text(json.dumps(record) + "\n", encoding="utf-8")
+    code = bulk_import.main(["--file", str(path), "--source", source, "--apply", "--yes"])
+    assert code == 0
+    page = client.get("/listings", params={"listing_type": "verification_profile", "q": record["name"]}).json()
+    assert any(i["endpoint_url"] == record["endpoint_url"] for i in page["listings"])
+
+
+def test_verification_and_template_url_are_imported_and_published(run) -> None:
+    source = _source()
+    record = _record(
+        output_schema={"type": "object"},
+        verification={"rules": [{"type": "unique", "field": "items[].id"}], "bounds": {"total": {"min": 0}}, "enforce_rules": True},
+        template={"template_id": "vt_x", "label": "meaningful", "url": "https://example.com/templates/vt_x.json"},
+    )
+    code, out, err = run([record], "--source", source, "--apply", "--yes")
+    assert code == 0, err
+    listing = client.get(
+        "/listings", params={"listing_type": "verification_profile", "q": record["name"]}
+    ).json()["listings"][0]
+    assert listing["verification"]["enforce_rules"] is True
+    assert listing["template_url"] == "https://example.com/templates/vt_x.json"
+    verify_action = next(a for a in listing["next_actions"] if a["action"] == "verify_output")
+    assert verify_action["body"]["enforce_rules"] is True
+    assert verify_action["body"]["rules"] == record["verification"]["rules"]
+
+    template = client.get(f"/listings/{listing['id']}/template").json()
+    assert template["verification"]["bounds"] == record["verification"]["bounds"]
+    assert template["template_url"] == "https://example.com/templates/vt_x.json"
+
+
+def test_solana_only_payment_wallet_is_derived_and_imported_unclaimed(run) -> None:
+    source = _source()
+    solana_payto = "HwXJGH7FMugPCoLiQnuG1nCUMWhBejMhkjdswNHmLeN8"
+    record = _record(
+        payment_wallet=None,
+        payment_options=[
+            {"network": "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", "asset": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "pay_to": solana_payto, "amount": "0.01", "unit": "per_call"}
+        ],
+    )
+    code, out, err = run([record], "--source", source, "--apply", "--yes")
+    assert code == 0, err
+    assert "1 record(s) have a Solana-only payment_wallet" in out
+    assert "1 record(s) had no payment_wallet of their own" in out
+    listing = client.get(
+        "/listings", params={"listing_type": "verification_profile", "q": record["name"]}
+    ).json()["listings"][0]
+    assert listing["payment_wallet"] == solana_payto
+    assert listing["claimed"] is False
+
+
+def test_unsupported_payment_networks_are_dropped_and_reported(run) -> None:
+    source = _source()
+    owner = Account.create()
+    record = _record(
+        payment_options=[
+            {"network": "eip155:8453", "asset": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "pay_to": owner.address, "amount": "0.02", "unit": "per_call"},
+            {"network": "xrpl:0", "asset": "x", "pay_to": "x", "amount": "0.02"},
+        ]
+    )
+    code, out, err = run([record], "--source", source, "--apply", "--yes")
+    assert code == 0, err
+    assert "1 payment_options entry/entries dropped" in out
+    listing = client.get(
+        "/listings", params={"listing_type": "verification_profile", "q": record["name"]}
+    ).json()["listings"][0]
+    assert len(listing["payment_options"]) == 1
+    assert listing["payment_options"][0]["network"] == "eip155:8453"
+
+
+def test_a_record_with_no_usable_payment_info_is_rejected(run) -> None:
+    source = _source()
+    record = _record(payment_wallet=None, payment_options=[{"network": "base", "asset": "x", "pay_to": "0xE11D166355825215D33A7B2dc47C05d4DcF6975C"}])
+    code, out, err = run([record], "--source", source, "--apply", "--yes")
+    assert code == 0, err
+    assert "0 record(s) valid, 1 rejected" in out
+    assert "no usable payment_wallet" in out

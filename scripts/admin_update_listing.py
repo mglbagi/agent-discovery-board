@@ -73,10 +73,13 @@ from app.core.reserved import is_reserved_address  # noqa: E402
 EDITABLE_FIELDS = (
     "name", "description", "listing_type", "task_categories", "endpoint_url", "payment_wallet",
     "pricing_model", "pricing_amount", "payment_options", "erc8004_identity", "verification_agent_id",
-    "output_schema", "submitted_by", "status",
+    "output_schema", "verification", "template_url", "submitted_by", "status",
 )
-NULLABLE_FIELDS = ("pricing_model", "pricing_amount", "erc8004_identity", "verification_agent_id", "output_schema")
-JSON_FIELDS = ("task_categories", "payment_options", "output_schema")
+NULLABLE_FIELDS = (
+    "pricing_model", "pricing_amount", "erc8004_identity", "verification_agent_id", "output_schema",
+    "verification", "template_url",
+)
+JSON_FIELDS = ("task_categories", "payment_options", "output_schema", "verification")
 COLUMNS = ", ".join(("id",) + EDITABLE_FIELDS + ("is_test", "created_at", "updated_at", "last_seen_at"))
 
 EXIT_OK, EXIT_USAGE, EXIT_GUARD = 0, 1, 2
@@ -343,7 +346,7 @@ def _run(args: argparse.Namespace) -> int:
             assignments["endpoint_key"] = normalize_endpoint_url(final["endpoint_url"])
         params: dict[str, Any] = {
             **{
-                f: (Jsonb(v) if f in ("payment_options", "output_schema") and v is not None else v)
+                f: (Jsonb(v) if f in ("payment_options", "output_schema", "verification") and v is not None else v)
                 for f, v in assignments.items()
             },
             "updated_at": now,

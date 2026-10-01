@@ -71,6 +71,12 @@ ERROR_CODES: dict[str, ErrorSpec] = {
     "listing_inactive": ErrorSpec(409, False, "The listing is inactive; reactivate it with PATCH status=active first."),
     "already_claimed": ErrorSpec(409, False, "This listing has already been claimed; it cannot be claimed again."),
     "no_template": ErrorSpec(404, False, "This listing has no output_schema set."),
+    "unclaimable_payment_wallet": ErrorSpec(
+        422,
+        False,
+        "This listing's payment_wallet is not an EVM address, so it has no EIP-191 signature to check against - "
+        "claim and remove-imported are EVM-only for now (see the README's known limitations).",
+    ),
     "not_imported": ErrorSpec(
         422,
         False,
@@ -248,6 +254,9 @@ def next_actions_for(code: str, *, method: str, path: str, extras: dict[str, Any
                 "its submitted_by).",
             )
         ]
+    if code == "unclaimable_payment_wallet":
+        base = path.removesuffix("/claim").removesuffix("/remove-imported")
+        return [action("GET", base, [], "Inspect the listing; see payment_wallet.")]
     if code == "rate_limited":
         wait = extras.get("retry_after")
         when = f"after {wait} seconds" if wait is not None else "after the Retry-After delay"

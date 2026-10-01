@@ -42,6 +42,8 @@ _UNIT_RE = re.compile(r"^[a-z][a-z0-9_-]{0,49}$")
 SUPPORTED_NAMESPACES = ("eip155", "solana")
 MAX_PAYMENT_OPTIONS = 20
 OUTPUT_SCHEMA_MAX_BYTES = 20_000
+VERIFICATION_MAX_BYTES = 20_000
+TEMPLATE_URL_MAX_LENGTH = 2048
 
 
 def _reject_control_chars(value: str, field: str) -> str:
@@ -94,9 +96,41 @@ def _validate_https_url(value: str) -> str:
     return value
 
 
+def is_evm_address(value: str) -> bool:
+    return bool(_ADDRESS_RE.match(value))
+
+
 def _validate_address(value: str, field: str) -> str:
-    if not _ADDRESS_RE.match(value):
+    if not is_evm_address(value):
         raise ValueError(f"{field} must be a 0x-prefixed 40-hex-character Ethereum address")
+    return value
+
+
+def _validate_payment_wallet(value: str) -> str:
+    """Unlike submitted_by (always EVM - EIP-191 signing requires it), payment_wallet
+    may be an EVM address or a Solana base58 pubkey: a seller's own pay-to address, not
+    something this board ever needs to sign for. A listing whose only payment_wallet is
+    Solana has no signature scheme to claim or self-remove it with yet (see
+    reserved.UNCLAIMED_IMPORT_SUBMITTED_BY's docstring and the README's known
+    limitations) - still importable, just stuck unclaimed until that's built."""
+    if is_evm_address(value) or is_base58_pubkey(value):
+        return value
+    raise ValueError("payment_wallet must be a 0x-prefixed 40-hex-character Ethereum address or a base58 Solana address")
+
+
+def validate_generic_url(value: str, field: str, max_length: int) -> str:
+    """A lighter check than endpoint_url's (http OR https, no scheme-specific policy
+    reason to be stricter) - used for links that merely point at more information
+    (source_url, template_url), never somewhere this board sends a request of its own."""
+    from urllib.parse import urlparse
+
+    if len(value) > max_length:
+        raise ValueError(f"{field} must be at most {max_length} characters")
+    if _CONTROL_CHARS.search(value):
+        raise ValueError(f"{field} contains control characters, which are not allowed")
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"{field} must be an http(s):// URL")
     return value
 
 
@@ -206,6 +240,22 @@ def _validate_output_schema(value: dict[str, Any] | None) -> dict[str, Any] | No
     return value
 
 
+def _validate_verification(value: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Same lenient treatment as output_schema: this board doesn't interpret or enforce
+    `rules`/`bounds`/`enforce_rules` itself (that's the sibling verification service's
+    job - see a listing's verify_output next_action), just stores and publishes
+    whatever shape it's given, within a sane size."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("verification must be a JSON object")
+    import json
+
+    if len(json.dumps(value)) > VERIFICATION_MAX_BYTES:
+        raise ValueError(f"verification must serialize to at most {VERIFICATION_MAX_BYTES} bytes")
+    return value
+
+
 def check_pricing_consistency(
     listing_type: str,
     pricing_model: str | None,
@@ -246,8 +296,9 @@ class ListingCreate(BaseModel):
     )
     endpoint_url: str = Field(description="Where to actually reach this service/agent. Must be https://.")
     payment_wallet: str = Field(
-        description="DEPRECATED - use payment_options. 0x-prefixed Ethereum address that receives payment for "
-        "this listing; kept (and still required) for backward compatibility.",
+        description="DEPRECATED - use payment_options. The seller's pay-to address: an EVM (0x) address or a "
+        "base58 Solana address; kept (and still required) for backward compatibility. A Solana payment_wallet "
+        "has no claim/self-removal signature scheme yet (EIP-191 is EVM-only) - importable, but stuck unclaimed.",
         json_schema_extra={"deprecated": True},
     )
     pricing_model: PricingModel | None = None
@@ -270,6 +321,18 @@ class ListingCreate(BaseModel):
         "verify a call's result against it with the sibling verification service's POST /verify/schema (see "
         "a listing's next_actions). Not validated as a schema itself, just stored and published.",
     )
+    verification: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional cross-field rules/bounds to enforce alongside output_schema, in the sibling "
+        "verification service's own shape (rules, bounds, enforce_rules) - e.g. "
+        '{"rules": [...], "bounds": {...}, "enforce_rules": true}. Published in next_actions and get_template so '
+        "an agent runs the full check, not just the schema. Not interpreted by this board, just stored.",
+    )
+    template_url: str | None = Field(
+        default=None,
+        description="A URL to this listing's full verification template (schema + rules + bounds) hosted "
+        "elsewhere, for reference alongside output_schema/verification.",
+    )
     submitted_by: str = Field(description="0x-prefixed Ethereum address of the submitter; who future edits/deletes must be signed by.")
 
     _clean_name = field_validator("name")(lambda v: _reject_control_chars(v, "name"))
@@ -277,7 +340,7 @@ class ListingCreate(BaseModel):
     _clean_listing_type = field_validator("listing_type")(lambda v: _validate_listing_type(v))
     _clean_categories = field_validator("task_categories")(lambda v: _validate_task_categories(v))
     _clean_url = field_validator("endpoint_url")(lambda v: _validate_https_url(v))
-    _clean_wallet = field_validator("payment_wallet")(lambda v: _validate_address(v, "payment_wallet"))
+    _clean_wallet = field_validator("payment_wallet")(lambda v: _validate_payment_wallet(v))
     _clean_submitter = field_validator("submitted_by")(lambda v: _validate_address(v, "submitted_by"))
     _clean_erc8004 = field_validator("erc8004_identity")(
         lambda v: _reject_control_chars(v, "erc8004_identity") if v is not None else v
@@ -286,6 +349,10 @@ class ListingCreate(BaseModel):
         lambda v: _reject_control_chars(v, "verification_agent_id") if v is not None else v
     )
     _clean_output_schema = field_validator("output_schema")(lambda v: _validate_output_schema(v))
+    _clean_verification = field_validator("verification")(lambda v: _validate_verification(v))
+    _clean_template_url = field_validator("template_url")(
+        lambda v: validate_generic_url(v, "template_url", TEMPLATE_URL_MAX_LENGTH) if v is not None else v
+    )
 
     @model_validator(mode="after")
     def _pricing(self) -> "ListingCreate":
@@ -312,6 +379,8 @@ class ListingUpdate(BaseModel):
     erc8004_identity: Erc8004Identity | None = None
     verification_agent_id: VerificationAgentId | None = None
     output_schema: dict[str, Any] | None = None
+    verification: dict[str, Any] | None = None
+    template_url: str | None = None
     status: Status | None = None
 
     _clean_name = field_validator("name")(lambda v: _reject_control_chars(v, "name") if v is not None else v)
@@ -325,9 +394,7 @@ class ListingUpdate(BaseModel):
         lambda v: _validate_task_categories(v) if v is not None else v
     )
     _clean_url = field_validator("endpoint_url")(lambda v: _validate_https_url(v) if v is not None else v)
-    _clean_wallet = field_validator("payment_wallet")(
-        lambda v: _validate_address(v, "payment_wallet") if v is not None else v
-    )
+    _clean_wallet = field_validator("payment_wallet")(lambda v: _validate_payment_wallet(v) if v is not None else v)
     _clean_erc8004 = field_validator("erc8004_identity")(
         lambda v: _reject_control_chars(v, "erc8004_identity") if v is not None else v
     )
@@ -336,6 +403,10 @@ class ListingUpdate(BaseModel):
     )
     _clean_payment_options = field_validator("payment_options")(_validate_payment_options_not_null)
     _clean_output_schema = field_validator("output_schema")(lambda v: _validate_output_schema(v))
+    _clean_verification = field_validator("verification")(lambda v: _validate_verification(v))
+    _clean_template_url = field_validator("template_url")(
+        lambda v: validate_generic_url(v, "template_url", TEMPLATE_URL_MAX_LENGTH) if v is not None else v
+    )
 
 
 class Badge(BaseModel):
@@ -367,6 +438,12 @@ class ListingNextAction(BaseModel):
     )
     price: str | None = Field(default=None, description="A short human-readable price summary, e.g. '$0.05 per_call'.")
     networks: list[str] = Field(default_factory=list, description="CAIP-2 network ids this can be paid on, if any.")
+    body: dict[str, Any] | None = Field(
+        default=None,
+        description="For verify_output: a suggested request body - {schema, rules, bounds, enforce_rules} as "
+        "applicable (rules/bounds/enforce_rules only when the listing declared verification) - with `output` "
+        "left for the caller to fill in with the service's actual result.",
+    )
 
 
 class ListingResponse(BaseModel):
@@ -437,11 +514,20 @@ class ListingResponse(BaseModel):
         description="A JSON Schema for this service's output, if it has one. See next_actions for how to verify "
         "against it. has_template (GET /listings filter) matches on whether this is set.",
     )
+    verification: dict[str, Any] | None = Field(
+        default=None,
+        description="Optional cross-field rules/bounds (rules, bounds, enforce_rules) to check alongside "
+        "output_schema - see next_actions.body and GET /listings/{id}/template.",
+    )
+    template_url: str | None = Field(
+        default=None, description="A URL to this listing's full verification template, if it hosts one elsewhere."
+    )
     next_actions: list[ListingNextAction] = Field(
         default_factory=list,
         description="How to actually use this listing: always a call_service action (this listing's own "
         "endpoint_url, price and networks); also a verify_output action when output_schema is set, pointing at "
-        "the sibling verification service's POST /verify/schema.",
+        "the sibling verification service's POST /verify/schema, with verification's rules/bounds/enforce_rules "
+        "folded into its suggested body when present.",
     )
 
 
@@ -490,6 +576,12 @@ class FacetCounts(BaseModel):
 class TemplateResponse(BaseModel):
     listing_id: str
     output_schema: dict[str, Any]
+    verification: dict[str, Any] | None = Field(
+        default=None, description="This listing's rules/bounds/enforce_rules, if it declared any."
+    )
+    template_url: str | None = Field(
+        default=None, description="A URL to this listing's full verification template, if it hosts one elsewhere."
+    )
 
 
 class RemovalResponse(BaseModel):

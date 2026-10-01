@@ -33,6 +33,7 @@ from app.core.models import (
     ListingsPage,
     PaymentOption,
     RemovalResponse,
+    TemplateResponse,
 )
 from app.core.signing_spec import signing_spec
 from app.core.stablecoins import stablecoin_pairs
@@ -131,8 +132,9 @@ def _build_listings_extension() -> dict[str, Any]:
                     "method": "GET",
                     "url": f"{LISTINGS_URL}/{{id}}/template",
                     "auth": "none",
-                    "description": "A listing's output_schema. 404 no_template if unset. See params.imports / "
-                    "ListingResponse.next_actions.",
+                    "description": "A listing's full verification template: output_schema, verification "
+                    "(rules/bounds/enforce_rules) and template_url. 404 no_template if output_schema is unset. "
+                    "See params.imports / ListingResponse.next_actions.",
                 },
                 "update": {"method": "PATCH", "url": f"{LISTINGS_URL}/{{id}}", "auth": "wallet-signature"},
                 "deactivate": {"method": "DELETE", "url": f"{LISTINGS_URL}/{{id}}", "auth": "wallet-signature"},
@@ -221,9 +223,11 @@ def _build_listings_extension() -> dict[str, Any]:
                 "description": "Every listing's next_actions says how to actually use it: a call_service entry "
                 "(this listing's own endpoint_url, a best-effort method, price and networks - the board does not "
                 "verify a listed service's actual HTTP method), and, when output_schema is set, a verify_output "
-                "entry pointing at the sibling verification service's POST /verify/schema. Distinct from the "
-                "error next_actions (params.errors.nextActionsConvention), which are about recovering from a "
-                "failed call to THIS board.",
+                "entry pointing at the sibling verification service's POST /verify/schema, with a suggested "
+                "`body` ({schema, rules, bounds, enforce_rules} as applicable) so a caller runs the full check, "
+                "not just the schema, when the listing declared verification. Distinct from the error "
+                "next_actions (params.errors.nextActionsConvention), which are about recovering from a failed "
+                "call to THIS board.",
                 "schema": ListingNextAction.model_json_schema(),
             },
             "paymentOptions": {
@@ -295,6 +299,19 @@ def _build_listings_extension() -> dict[str, Any]:
                 "/listings/{id}/template and the get_template tool, and surfaced in next_actions as a "
                 "verify_output entry pointing at the sibling verification service's POST /verify/schema. "
                 "has_template filters GET /listings by whether it's set. 404 no_template if it isn't.",
+                "verification": "Optional alongside output_schema: {rules, bounds, enforce_rules} in the "
+                "sibling verification service's own shape, for cross-field checks beyond the schema. When set, "
+                "its rules/bounds/enforce_rules are folded into the verify_output next_action's suggested body "
+                "(so a caller runs the full check, not just the schema) and returned by GET /listings/{id}"
+                "/template and get_template. Not interpreted by this board, just stored and published.",
+                "templateUrl": "Optional: a URL to this listing's full verification template hosted elsewhere "
+                "(e.g. the sibling verification service's own template store). Returned alongside output_schema "
+                "by GET /listings/{id}/template and get_template.",
+                "solanaPaymentWallet": "payment_wallet accepts an EVM address or a base58 Solana address (a "
+                "seller's own pay-to, never something this board signs for). Claiming and self-removal "
+                "(POST .../claim, POST .../remove-imported) are EIP-191/EVM-only, so a listing whose "
+                "payment_wallet is a Solana address is importable but cannot be claimed or self-removed yet - "
+                "422 unclaimable_payment_wallet if attempted (see the README's known limitations).",
             },
             "deprecatedFields": {"payment_wallet": "Use payment_options. Still required and still returned."},
             "errors": {
@@ -331,6 +348,7 @@ def _build_listings_extension() -> dict[str, Any]:
             "compactSchema": CompactListingResponse.model_json_schema(),
             "listSchema": ListingsPage.model_json_schema(),
             "heartbeatSchema": HeartbeatResponse.model_json_schema(),
+            "templateSchema": TemplateResponse.model_json_schema(),
             "example": _EXAMPLE_LISTING_CREATE,
         },
     }

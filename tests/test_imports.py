@@ -99,6 +99,35 @@ def test_an_organic_listing_is_claimed_by_default_with_no_source() -> None:
     assert created["imported_at"] is None and created["last_synced_at"] is None
 
 
+# ---- payment_wallet accepts a Solana address (sellers without an EVM pay-to) -----------------
+
+SOLANA_PAYTO = "HwXJGH7FMugPCoLiQnuG1nCUMWhBejMhkjdswNHmLeN8"
+
+
+def test_an_organic_listing_can_use_a_solana_payment_wallet() -> None:
+    payload = listing_payload("offering", "0x" + "ab" * 20, payment_wallet=SOLANA_PAYTO)
+    response = client.post("/listings", json=payload)
+    assert response.status_code == 201, response.text
+    assert response.json()["payment_wallet"] == SOLANA_PAYTO
+
+
+def test_claiming_a_solana_payment_wallet_listing_is_unclaimable() -> None:
+    owner = Account.create()
+    row = import_listing(_source(), SOLANA_PAYTO)
+    header = wallet_auth_header(owner, action="claim-listing", listing_id=row["id"])
+    response = client.post(f"/listings/{row['id']}/claim", headers={"X-Wallet-Auth": header})
+    assert_error(response, 422, "unclaimable_payment_wallet")
+
+
+def test_removing_a_solana_payment_wallet_listing_is_unclaimable() -> None:
+    owner = Account.create()
+    row = import_listing(_source(), SOLANA_PAYTO)
+    header = wallet_auth_header(owner, action="remove-imported-listing", listing_id=row["id"])
+    response = client.post(f"/listings/{row['id']}/remove-imported", headers={"X-Wallet-Auth": header})
+    assert_error(response, 422, "unclaimable_payment_wallet")
+    assert client.get(f"/listings/{row['id']}").status_code == 200  # untouched
+
+
 # ---- claim flow -------------------------------------------------------------------------
 
 
