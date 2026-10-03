@@ -423,6 +423,33 @@ class Badge(BaseModel):
     source: str
 
 
+class FreePath(BaseModel):
+    """How to try the verifier without paying - read from its own agent-card, never assumed."""
+
+    transport: str = Field(description="MCP transport, e.g. 'streamable-http'.")
+    url: str = Field(description="The verifier's MCP endpoint.")
+    tool: str = Field(description="The MCP tool to call, e.g. 'verify_schema'.")
+    calls_per_client_per_day: int | None = Field(
+        default=None, description="The verifier's current free allowance, per client per day."
+    )
+    max_input_bytes: int | None = Field(default=None, description="Largest input a free call accepts.")
+    after_free_trial: str | None = Field(default=None, description="What the verifier says happens once the allowance is used.")
+
+
+class VerifierInfoStatus(BaseModel):
+    """Provenance of the verifier facts on a verify_output action (price, networks, protocol,
+    free_path): read from the verifier's own public documents, cached, refreshed in the
+    background. Never blocks or fails a listing response."""
+
+    status: Literal["live", "last_known", "partial", "unavailable"] = Field(
+        description="live: read successfully and not since failed. last_known: the last successful values, "
+        "kept because the latest refresh failed (or this process has not re-read them yet). partial: only one "
+        "of the two documents has ever been read. unavailable: neither has - price/networks/free_path are null."
+    )
+    fetched_at: datetime | None = Field(default=None, description="When the (oldest) values shown were read.")
+    sources: list[str] = Field(default_factory=list, description="The documents these facts come from.")
+
+
 class ListingNextAction(BaseModel):
     """How to actually DO something with a listing - distinct from the error NextAction
     (app/core/errors.py), which is about recovering from a failed API call to THIS
@@ -444,6 +471,17 @@ class ListingNextAction(BaseModel):
         "verify_schema MCP tool - task_id, expected_schema, submitted_output, plus rules/bounds/enforce_rules "
         "when the listing declared verification - with task_id and submitted_output left for the caller to "
         "fill in (field names match the verifier's own API exactly).",
+    )
+    protocol: str | None = Field(
+        default=None, description="verify_output only: the payment protocol the verifier uses, e.g. 'x402 v2'."
+    )
+    free_path: FreePath | None = Field(
+        default=None,
+        description="verify_output only: how to try the verifier free - its MCP endpoint, tool and current "
+        "free allowance. Null while the verifier's documents have never been read (see info).",
+    )
+    info: VerifierInfoStatus | None = Field(
+        default=None, description="verify_output only: whether price/networks/protocol/free_path are live or last-known."
     )
 
 

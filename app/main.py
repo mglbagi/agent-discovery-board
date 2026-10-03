@@ -11,6 +11,7 @@ from app.api.routes.health import router as health_router
 from app.api.routes.listings import router as listings_router
 from app.api.routes.site_meta import router as site_meta_router
 from app.core.constants import SERVICE_NAME, SERVICE_VERSION
+from app.core import verifier_info
 from app.core.db import close_db
 from app.core.maintenance import startup_maintenance
 from app.core.errors import ERROR_CODES, error_codes_manifest, install_error_handlers
@@ -39,6 +40,9 @@ async def lifespan(app: FastAPI):
     # the service still starts, and the first request that needs the DB retries the same
     # initialization (see app/core/db.py's lazy _ensure_schema).
     await asyncio.to_thread(startup_maintenance)
+    # Read the verifier's price/networks/free path from its own public documents in the
+    # background (never delays boot; see app/core/verifier_info.py).
+    verifier_info.start()
     # A mounted sub-app's own lifespan doesn't run, so the MCP session manager is
     # started here for the lifetime of the service instead.
     async with mcp_server.session_manager.run():

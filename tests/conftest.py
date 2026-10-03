@@ -18,6 +18,9 @@ os.environ["LISTING_MUTATE_RATE_LIMIT_MAX_REQUESTS"] = "1000"
 os.environ["LISTING_MUTATE_GLOBAL_DAILY_CAP"] = "100000"
 # Badge lookups default to disabled in tests unless a test explicitly enables them.
 os.environ.pop("BOARD_PAYER_PRIVATE_KEY", None)
+# No test may reach the real verification service for its price/free-path documents
+# (app/core/verifier_info.py); tests that need that data inject it.
+os.environ["VERIFIER_INFO_REFRESH"] = "0"
 
 # Tests wipe the listings table before running, so they must NEVER run against the
 # real production database. TEST_DATABASE_URL points at a separate database created

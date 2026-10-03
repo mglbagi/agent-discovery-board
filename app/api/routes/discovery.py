@@ -226,7 +226,13 @@ def _build_listings_extension() -> dict[str, Any]:
                 "entry pointing at the sibling verification service's POST /verify/schema, with a suggested "
                 "`body` using that service's own field names exactly (task_id, expected_schema, "
                 "submitted_output, plus rules/bounds/enforce_rules when the listing declared verification) - "
-                "fill in task_id and submitted_output and send it on unmodified. Distinct from the error "
+                "fill in task_id and submitted_output and send it on unmodified. The verify_output entry also "
+                "says what a check costs and how to try one free: price, networks, protocol (x402 v2) and "
+                "free_path (the verifier's MCP endpoint, the verify_schema tool and its current free allowance), "
+                "all read from the verifier's own public documents (/.well-known/x402 and its agent-card) - "
+                "cached, refreshed in the background, never hard-coded - with info.status saying whether they "
+                "are live, last_known (kept because the latest refresh failed) or unavailable (never read yet; "
+                "price/networks/free_path are then null). Same data over REST and the MCP tools. Distinct from the error "
                 "next_actions (params.errors.nextActionsConvention), which are about recovering from a failed "
                 "call to THIS board.",
                 "schema": ListingNextAction.model_json_schema(),

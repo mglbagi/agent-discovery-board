@@ -273,6 +273,18 @@ def _ensure_schema() -> None:
             # and published verbatim (see app/core/models.py's lenient validators).
             conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS verification JSONB")
             conn.execute("ALTER TABLE listings ADD COLUMN IF NOT EXISTS template_url TEXT")
+            # The last verifier price/networks/free-path facts successfully read from its public
+            # documents (app/core/verifier_info.py) - one row, so a restart while the verifier is
+            # unreachable still has something true to show, marked last_known.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS verifier_info_cache (
+                    id INTEGER PRIMARY KEY,
+                    data JSONB NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
         _schema_ready = True
 
 
@@ -715,6 +727,21 @@ def facet_counts(
 
         _log_search_query(conn, q, result["total"])
         return result
+
+
+def load_verifier_info() -> dict[str, Any] | None:
+    with _connection() as conn:
+        row = conn.execute("SELECT data FROM verifier_info_cache WHERE id = 1").fetchone()
+    return row["data"] if row else None
+
+
+def save_verifier_info(data: dict[str, Any]) -> None:
+    with _connection() as conn:
+        conn.execute(
+            "INSERT INTO verifier_info_cache (id, data, updated_at) VALUES (1, %s, %s) "
+            "ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at",
+            (Jsonb(data), datetime.now(timezone.utc)),
+        )
 
 
 def purge_expired_test_listings(cutoff: datetime, limit: int) -> list[str]:

@@ -22,7 +22,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Path, Query, Request
 
-from app.core import db, demo_data, maintenance, score_client
+from app.core import db, demo_data, maintenance, score_client, verifier_info
 from app.core.activity import HEARTBEAT_MIN_INTERVAL, is_stale, last_activity_at
 from app.core.constants import DUPLICATE_GUARDED_LISTING_TYPE, TASK_CATEGORIES
 from app.core.errors import ApiError
@@ -31,6 +31,7 @@ from app.core.models import (
     CompactListingResponse,
     ErrorResponse,
     FacetCounts,
+    FreePath,
     HeartbeatResponse,
     ListingCreate,
     ListingNextAction,
@@ -40,6 +41,7 @@ from app.core.models import (
     RemovalResponse,
     Status,
     TemplateResponse,
+    VerifierInfoStatus,
     check_pricing_consistency,
     is_evm_address,
     is_valid_caip2_id,
@@ -142,23 +144,47 @@ def _next_actions(row: dict[str, Any]) -> list[ListingNextAction]:
             body["bounds"] = verification["bounds"]
         if verification.get("enforce_rules"):
             body["enforce_rules"] = True
-        description = "POST this body (fill in task_id and submitted_output) to the sibling verification "
-        description += "service's /verify/schema or its verify_schema MCP tool to check the output against the "
-        description += (
-            "schema AND run its cross-field rules/bounds (enforce_rules: true), not just the schema. "
-            if "rules" in body or "bounds" in body or "enforce_rules" in body
-            else "schema. "
+        info = verifier_info.snapshot()
+        payment, free = info["payment"], info["free_path"]
+        endpoint = (payment or {}).get("endpoint") or f"{VERIFICATION_SERVICE_URL}/verify/schema"
+        has_rules = "rules" in body or "bounds" in body or "enforce_rules" in body
+        description = (
+            f"POST this body (fill in task_id and submitted_output) to {endpoint} to check the output against "
+            + ("the schema AND run its cross-field rules/bounds (enforce_rules: true), not just the schema. "
+               if has_rules else "the schema. ")
         )
-        description += "See that service's own docs for its exact response shape and pricing."
+        if payment:
+            description += (
+                f"Cost: {payment['price']} {payment['currency'] or ''} per check via {payment['protocol']} on "
+                f"{', '.join(payment['networks'])}. "
+            ).replace("  ", " ")
+        else:
+            description += "Cost: not available right now (the verifier's documents have not been read yet). "
+        if free:
+            description += (
+                f"Free path: call the {free['tool']} tool on its MCP endpoint {free['url']} - "
+                f"{free['calls_per_client_per_day']} free calls per client per day"
+                + (f", inputs up to {free['max_input_bytes']} bytes" if free.get("max_input_bytes") else "")
+                + ". "
+            )
+        else:
+            description += "Free path: not available right now. "
+        description += (
+            f"These facts come from the verifier's own documents (info.status: {info['status']}; "
+            "info.sources lists them)."
+        )
         actions.append(
             ListingNextAction(
                 action="verify_output",
                 description=description,
-                url=f"{VERIFICATION_SERVICE_URL}/verify/schema",
-                method="POST",
-                price=None,
-                networks=[],
+                url=endpoint,
+                method=(payment or {}).get("method", "POST"),
+                price=f"{payment['price']} {payment['currency'] or ''} per check".replace("  ", " ") if payment else None,
+                networks=payment["networks"] if payment else [],
                 body=body,
+                protocol=payment["protocol"] if payment else None,
+                free_path=FreePath(**free) if free else None,
+                info=VerifierInfoStatus(status=info["status"], fetched_at=info["fetched_at"], sources=info["sources"]),
             )
         )
     return actions
