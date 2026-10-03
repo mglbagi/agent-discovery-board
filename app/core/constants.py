@@ -10,7 +10,8 @@ SERVICE_DESCRIPTION = (
 )
 
 # task_categories: a FIXED list (unlike listing_type below). Requests with a
-# category outside this set are rejected with 422.
+# category outside this set are rejected with 422. The list only ever grows: a category is
+# never renamed or removed, because stored listings and clients refer to it by name.
 TASK_CATEGORIES: tuple[str, ...] = (
     "data extraction",
     "summarization",
@@ -22,6 +23,13 @@ TASK_CATEGORIES: tuple[str, ...] = (
     "image generation",
     "data validation",
     "scheduling",
+    # Added for browsing imported verification profiles. Plain words, no "&" or "/": an
+    # unencoded "&" in a query string silently splits the task_category parameter.
+    "finance and tax",
+    "crypto and blockchain data",
+    "security and compliance",
+    "commerce and shopping",
+    "media generation",
     "other",
 )
 

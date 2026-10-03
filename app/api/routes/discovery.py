@@ -125,7 +125,8 @@ def _build_listings_extension() -> dict[str, Any]:
                     "url": f"{LISTINGS_URL}/facets",
                     "auth": "none",
                     "description": "Counts per task_category/listing_type/network/source for the same filters "
-                    "(including q) as browse, above - not paginated. See params.facets.",
+                    "(including q) as browse, above - not paginated. by_task_category lists every "
+                    "category in params.taskCategories (0 when none match). See params.facets.",
                 },
                 "get": {"method": "GET", "url": f"{LISTINGS_URL}/{{id}}", "auth": "none"},
                 "getTemplate": {

@@ -90,6 +90,8 @@ TOOL_DESCRIPTION = (
     "verifier's own public documents; see info.status). Pass compact=true for a reduced shape (id, name, endpoint_url, price, "
     "networks, task_categories, claimed) when just scanning many results. See also "
     "get_listing (one by id), list_facets (counts per dimension) and get_template. "
+    "The task_category filter takes any of these fixed values (a listing can carry several): "
+    + ", ".join(TASK_CATEGORIES) + ". "
     "Free to call, no payment or account required. Errors come back as isError results "
     "with a stable `error_code` and `next_actions`."
 )
@@ -317,7 +319,8 @@ LIST_FACETS_DESCRIPTION = (
     "search_listings' own description), so you can see what's out there before "
     "deciding how to narrow a search, instead of paging through everything. Not "
     "paginated: a small, mostly-fixed number of buckets per dimension, never one entry "
-    "per listing. Free, no payment or account required."
+    "per listing. by_task_category lists every category (0 when none match): "
+    + ", ".join(TASK_CATEGORIES) + ". Free, no payment or account required."
 )
 _LIST_FACETS_ANNOTATIONS = ToolAnnotations(
     title="Facet counts for the Agent Discovery Board", readOnlyHint=True, destructiveHint=False,

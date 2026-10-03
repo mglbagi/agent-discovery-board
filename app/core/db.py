@@ -22,7 +22,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from app.core.activity import ACTIVITY_SQL, STALE_AFTER_DAYS
-from app.core.constants import DUPLICATE_GUARDED_LISTING_TYPE
+from app.core.constants import DUPLICATE_GUARDED_LISTING_TYPE, TASK_CATEGORIES
 from app.core.endpoint import normalize_endpoint_url
 from app.core.pagination import AnyCursor
 from app.core.stablecoins import stablecoin_keys
@@ -658,12 +658,16 @@ def list_listings(
 
 def _facet_breakdowns(conn: psycopg.Connection, where: str, params: dict[str, Any]) -> dict[str, Any]:
     total = conn.execute(f"SELECT COUNT(*) AS n FROM listings WHERE {where}", params).fetchone()["n"]
-    by_category = {
+    counted = {
         r["c"]: r["n"]
         for r in conn.execute(
             f"SELECT c, COUNT(*) AS n FROM listings, unnest(task_categories) AS c WHERE {where} GROUP BY c", params
         ).fetchall()
     }
+    # Every category in the fixed set is listed (0 when nothing matches), so the facet doubles
+    # as the category menu; a stored category outside the set (none today) is still counted.
+    by_category = {c: counted.get(c, 0) for c in TASK_CATEGORIES}
+    by_category.update({c: n for c, n in counted.items() if c not in by_category})
     by_type = {
         r["listing_type"]: r["n"]
         for r in conn.execute(f"SELECT listing_type, COUNT(*) AS n FROM listings WHERE {where} GROUP BY listing_type", params).fetchall()

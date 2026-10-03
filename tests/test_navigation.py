@@ -189,7 +189,8 @@ def test_facets_respects_the_same_filters_as_browse() -> None:
 
     facets = client.get("/listings/facets", params={"listing_type": marker, "task_category": "code review"}).json()
     assert facets["total"] == 1
-    assert facets["by_task_category"] == {"code review": 1}
+    # every category is listed (see test_task_categories.py); only the matching one counts
+    assert {c: n for c, n in facets["by_task_category"].items() if n} == {"code review": 1}
 
 
 def test_facets_mcp_tool_matches_rest() -> None:
