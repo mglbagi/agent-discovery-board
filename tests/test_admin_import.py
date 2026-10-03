@@ -464,7 +464,7 @@ def test_the_endpoint_and_the_script_do_the_same_thing(tmp_path, capsys) -> None
     path = tmp_path / "records.jsonl"
     path.write_text(_jsonl(records), encoding="utf-8")
     assert bulk_import.main(["--file", str(path), "--source", script_source, "--apply", "--yes",
-                             "--log-file", str(tmp_path / "log")]) == 0
+                             "--allow-local-board-url", "--log-file", str(tmp_path / "log")]) == 0
     out = capsys.readouterr().out
     assert f"Inserted {api['added']}, updated {api['updated']}, newly marked missing {api['stale']}" in out
     assert f"{api['valid']} record(s) valid, {api['rejected']} rejected" in out
@@ -477,14 +477,52 @@ def test_the_endpoint_and_the_script_do_the_same_thing(tmp_path, capsys) -> None
             assert via_api[field] == via_script[field], field
 
 
-def test_the_script_refuses_to_apply_without_the_boards_own_url(tmp_path, monkeypatch, capsys) -> None:
-    monkeypatch.delenv("SERVICE_BASE_URL")
+def _script_apply(tmp_path, *extra) -> tuple[int, str, str, dict]:
+    record = _record()
     path = tmp_path / "r.json"
-    path.write_text(json.dumps([_record()]), encoding="utf-8")
-    code = bulk_import.main(["--file", str(path), "--source", _source(), "--apply", "--yes",
-                             "--log-file", str(tmp_path / "log")])
-    assert code == 1
-    assert "SERVICE_BASE_URL" in capsys.readouterr().err
+    path.write_text(json.dumps([record]), encoding="utf-8")
+    source = _source()
+    code = bulk_import.main(["--file", str(path), "--source", source, "--apply", "--yes",
+                             "--log-file", str(tmp_path / "log"), *extra])
+    return code, source, record
+
+
+def test_the_script_refuses_to_apply_without_a_board_url(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.delenv("SERVICE_BASE_URL")
+    code, source, record = _script_apply(tmp_path)
+    assert code == 1 and "no board URL" in capsys.readouterr().err
+    assert _exists(source, record) == {}
+
+
+def test_the_script_refuses_a_local_board_url_unless_told_it_is_deliberate(tmp_path, capsys) -> None:
+    # the usual mistake: an operator shell has SERVICE_BASE_URL=http://127.0.0.1:... in .env while
+    # DATABASE_URL points at production - that must not write localhost links into production
+    assert os.environ["SERVICE_BASE_URL"].startswith("http://127.0.0.1")
+    code, source, record = _script_apply(tmp_path)
+    assert code == 1 and "local address" in capsys.readouterr().err
+    assert _exists(source, record) == {}
+
+
+def test_the_script_builds_links_from_an_explicit_board_url(tmp_path, capsys) -> None:
+    code, source, record = _script_apply(tmp_path, "--board-url", "https://board.example.test/")
+    assert code == 0
+    assert "https://board.example.test/listings/{id}/template" in capsys.readouterr().out
+    listing = _get(source, record)
+    assert listing["template_url"] == f"https://board.example.test/listings/{listing['id']}/template"
+
+
+def test_the_script_refuses_a_non_http_board_url(tmp_path, capsys) -> None:
+    code, source, record = _script_apply(tmp_path, "--board-url", "ftp://board.example.test")
+    assert code == 1 and "not an http(s) URL" in capsys.readouterr().err
+
+
+def test_local_urls_are_recognized() -> None:
+    from app.core.import_sync import is_local_url
+
+    for local in ("http://127.0.0.1:8200", "http://localhost:3000", "http://[::1]:8000", "http://x.localhost", "http://0.0.0.0"):
+        assert is_local_url(local), local
+    for public in ("https://agent-discovery-board.onrender.com", "https://board.example.test", "https://127.example.com"):
+        assert not is_local_url(public), public
 
 
 # ---- template links point at the board itself ------------------------------------------------------

@@ -52,7 +52,9 @@ def run(capsys, tmp_path):
     def _run(records: list[dict], *argv: str, log: bool = True):
         records_file = tmp_path / f"records-{uuid.uuid4().hex[:6]}.json"
         records_file.write_text(json.dumps(records), encoding="utf-8")
-        args = ["--file", str(records_file)] + list(argv) + (["--log-file", str(log_file)] if log else [])
+        args = ["--file", str(records_file), "--allow-local-board-url"] + list(argv) + (
+            ["--log-file", str(log_file)] if log else []
+        )
         code = bulk_import.main(args)
         captured = capsys.readouterr()
         return code, captured.out, captured.err
@@ -269,7 +271,7 @@ def test_jsonl_input_is_accepted(run, tmp_path) -> None:
     record = _record()
     path = tmp_path / "records.jsonl"
     path.write_text(json.dumps(record) + "\n", encoding="utf-8")
-    code = bulk_import.main(["--file", str(path), "--source", source, "--apply", "--yes"])
+    code = bulk_import.main(["--file", str(path), "--source", source, "--apply", "--yes", "--allow-local-board-url"])
     assert code == 0
     page = client.get("/listings", params={"listing_type": "verification_profile", "q": record["name"]}).json()
     assert any(i["endpoint_url"] == record["endpoint_url"] for i in page["listings"])

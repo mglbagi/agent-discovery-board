@@ -98,6 +98,12 @@ def main(argv: list[str] | None = None) -> int:
         "--source", default=None,
         help="source identifier, e.g. 'x402_bazaar' - overrides every record's own source/_import.source if given",
     )
+    ap.add_argument(
+        "--board-url", default=None,
+        help="the board's public URL, which imported listings' template_url is built from "
+        "(default: SERVICE_BASE_URL; a local address is refused unless --allow-local-board-url)",
+    )
+    ap.add_argument("--allow-local-board-url", action="store_true", help="accept a localhost board URL (a local board)")
     ap.add_argument("--file", required=True, type=Path, help="JSON array or .jsonl file of records to import")
     ap.add_argument("--apply", action="store_true", help="write the changes (default is a dry run)")
     ap.add_argument("--yes", action="store_true", help="with --apply, skip the confirmation prompt")
@@ -123,13 +129,13 @@ def _run(args: argparse.Namespace) -> int:
     print(f"Mode: {'APPLY' if args.apply else 'DRY RUN (nothing will be written)'}")
     print(f"{len(records)} record(s) in {args.file}")
 
-    template_base = import_sync.board_template_base()
-    if args.apply and template_base is None:
-        raise AdminError(
-            "SERVICE_BASE_URL is not set. Imported listings' template_url is the board's own "
-            "GET /listings/{id}/template, built from it; without it a sync would write the source's "
-            "template links back over the board's own. Set it to the board's public URL and re-run."
-        )
+    template_base = None
+    if args.apply:
+        try:
+            template_base = import_sync.resolve_board_url(args.board_url, allow_local=args.allow_local_board_url)
+        except ValueError as exc:
+            raise AdminError(str(exc)) from exc
+        print(f"Template links: {template_base}/listings/{{id}}/template")
 
     db.init_db()  # ensures the schema (and its do_not_import table) exists even on a fresh DB
     plan = import_sync.plan_sync(records, args.source, now)

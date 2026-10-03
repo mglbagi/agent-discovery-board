@@ -12,12 +12,14 @@ payment problem or any other invalid field are rejected individually and reporte
 never abort the rest of the batch.
 """
 
+import ipaddress
 import json
 import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
+from urllib.parse import urlparse
 
 from app.core import db
 from app.core.imports import ImportRecordError, build_import_row
@@ -55,6 +57,39 @@ def board_template_base() -> str | None:
     is built from. None only where it isn't configured (e.g. an operator's shell)."""
     value = (os.getenv("SERVICE_BASE_URL") or "").strip().rstrip("/")
     return value or None
+
+
+def is_local_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False  # an ordinary name (even one that starts with "127.")
+    return address.is_loopback or address.is_unspecified
+
+
+def resolve_board_url(explicit: str | None, *, allow_local: bool = False) -> str:
+    """The board URL an operator script builds template links from: --board-url, else
+    SERVICE_BASE_URL. A local address is refused unless the operator says it is deliberate -
+    an operator's shell usually has SERVICE_BASE_URL=http://127.0.0.1:... in its .env while
+    DATABASE_URL points at production, and a sync would otherwise write localhost links into
+    the production listings."""
+    value = (explicit or board_template_base() or "").strip().rstrip("/")
+    if not value:
+        raise ValueError(
+            "no board URL: pass --board-url https://<the board's public URL> (or set SERVICE_BASE_URL). "
+            "Imported listings' template_url is the board's own GET /listings/{id}/template, built from it."
+        )
+    if urlparse(value).scheme not in ("http", "https") or not urlparse(value).hostname:
+        raise ValueError(f"the board URL {value!r} is not an http(s) URL")
+    if is_local_url(value) and not allow_local:
+        raise ValueError(
+            f"the board URL {value} is a local address; refusing to write it into listings. Pass --board-url with the "
+            "board's public URL, or --allow-local-board-url if this really is a local board."
+        )
+    return value
 
 
 def validate_all(
