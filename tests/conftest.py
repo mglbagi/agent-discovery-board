@@ -16,6 +16,9 @@ os.environ["LISTING_CREATE_RATE_LIMIT_MAX_REQUESTS"] = "1000"
 os.environ["LISTING_CREATE_GLOBAL_DAILY_CAP"] = "100000"
 os.environ["LISTING_MUTATE_RATE_LIMIT_MAX_REQUESTS"] = "1000"
 os.environ["LISTING_MUTATE_GLOBAL_DAILY_CAP"] = "100000"
+# POST /admin/import refuses to start without a key (app/core/import_auth.py). Whitespace
+# around it on purpose: the app strips it, and tests send the stripped value.
+os.environ["IMPORT_API_KEY"] = "  test-import-key-0123456789abcdef  "
 # Badge lookups default to disabled in tests unless a test explicitly enables them.
 os.environ.pop("BOARD_PAYER_PRIVATE_KEY", None)
 # No test may reach the real verification service for its price/free-path documents

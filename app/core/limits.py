@@ -16,20 +16,24 @@ class MaxBodySizeMiddleware:
     upfront and also enforcing the cap while the body is actually read (in case
     Content-Length is missing or understates the true size)."""
 
-    def __init__(self, app: ASGIApp, max_bytes: int = MAX_BODY_BYTES) -> None:
+    def __init__(self, app: ASGIApp, max_bytes: int = MAX_BODY_BYTES, path_limits: dict[str, int] | None = None) -> None:
         self.app = app
         self.max_bytes = max_bytes
+        # A few endpoints legitimately take a bigger body (POST /admin/import takes a whole
+        # source's listings); each such exact path gets its own cap instead of this default.
+        self.path_limits = path_limits or {}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
+        max_bytes = self.path_limits.get(scope.get("path", ""), self.max_bytes)
         headers = dict(scope.get("headers") or [])
         content_length = headers.get(b"content-length")
         if content_length is not None:
             try:
-                too_big = int(content_length) > self.max_bytes
+                too_big = int(content_length) > max_bytes
             except ValueError:
                 too_big = False
             if too_big:
@@ -49,7 +53,7 @@ class MaxBodySizeMiddleware:
             message = await receive()
             if message["type"] == "http.request":
                 total += len(message.get("body", b""))
-                if total > self.max_bytes:
+                if total > max_bytes:
                     raise ValueError("Request body exceeded the maximum allowed size")
             return message
 

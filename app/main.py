@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.openapi.utils import get_openapi
 
+from app.api.routes.admin_import import router as admin_import_router
 from app.api.routes.discovery import router as discovery_router
 from app.api.routes.health import router as health_router
 from app.api.routes.listings import router as listings_router
@@ -15,6 +16,7 @@ from app.core import verifier_info
 from app.core.db import close_db
 from app.core.maintenance import startup_maintenance
 from app.core.errors import ERROR_CODES, error_codes_manifest, install_error_handlers
+from app.core.import_auth import IMPORT_MAX_BODY_BYTES, IMPORT_PATH
 from app.core.limits import MaxBodySizeMiddleware
 from app.core.request_logging import ErrorRequestLoggingMiddleware
 from app.mcp_server import MCP_PATH, McpPathNormalizer, create_server
@@ -63,6 +65,7 @@ app.include_router(health_router)
 app.include_router(listings_router)
 app.include_router(discovery_router)
 app.include_router(site_meta_router)
+app.include_router(admin_import_router)
 app.mount(MCP_PATH, mcp_server.streamable_http_app())
 app.add_middleware(McpPathNormalizer)  # innermost: only rewrites exactly "/mcp" -> "/mcp/"
 
@@ -86,7 +89,7 @@ app.openapi = _openapi  # type: ignore[method-assign]
 # Added last so it wraps everything else (Starlette applies middleware
 # outermost-last-added-first): oversized requests are rejected before any body
 # parsing happens.
-app.add_middleware(MaxBodySizeMiddleware)
+app.add_middleware(MaxBodySizeMiddleware, path_limits={IMPORT_PATH: IMPORT_MAX_BODY_BYTES})
 
 # Logs method/path/client/User-Agent for any non-2xx/3xx response, so things like
 # 404s and 429s are diagnosable directly from Render's logs.

@@ -13,6 +13,10 @@ services:
         sync: false
       - key: SERVICE_BASE_URL
         sync: false
+      # Required: authorizes POST /admin/import (app/core/import_auth.py); the service
+      # will not start without it. A long random secret - set it in the Render dashboard.
+      - key: IMPORT_API_KEY
+        sync: false
       # Optional; unset by default so trust-score badges ship disabled (see README
       # "Trust score badges"). Set this in the Render dashboard, never here.
       - key: BOARD_PAYER_PRIVATE_KEY

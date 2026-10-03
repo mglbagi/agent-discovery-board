@@ -836,20 +836,49 @@ _IMPORT_REFRESHABLE_COLUMNS = (
 )
 
 
-def import_upsert(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+def existing_import_listings(source: str, endpoint_urls: list[str]) -> dict[str, bool]:
+    """Normalized endpoint key -> claimed, for the listings of `source` that already exist
+    among these endpoint_urls. Read-only: lets a dry run split "would add" from "would
+    update" (and count the claimed ones, whose content a sync never touches)."""
+    if not endpoint_urls:
+        return {}
+    keys = [normalize_endpoint_url(u) for u in endpoint_urls]
+    with _connection() as conn:
+        rows = conn.execute(
+            "SELECT endpoint_key, claimed FROM listings WHERE source = %s AND endpoint_key = ANY(%s)", (source, keys)
+        ).fetchall()
+    return {r["endpoint_key"]: r["claimed"] for r in rows}
+
+
+def import_upsert(row: dict[str, Any], *, template_base: str | None = None) -> tuple[dict[str, Any], bool]:
     """Insert a freshly-imported listing, or - if `row["source"]` + the normalized
     endpoint_url already exist (listings_source_endpoint_uniq) - upsert it instead of
     creating a duplicate. While the existing row is still unclaimed, a resync refreshes
     its content (_IMPORT_REFRESHABLE_COLUMNS) from the latest `row`; once claimed, that
     content is the owner's and a resync leaves it alone, only touching last_synced_at and
     clearing missing_from_source_since. Returns (row, was_inserted). Caller must check
-    is_in_do_not_import first."""
+    is_in_do_not_import first.
+
+    `template_base` (the board's own public URL), when given, makes template_url the
+    board's own GET /listings/{id}/template for every listing that has an output_schema
+    (and NULL for one that doesn't - that route would 404), instead of whatever link the
+    source record carried. The id is the stored row's, so a re-sync of an existing listing
+    keeps pointing at the id it already has."""
     row = {**row, "endpoint_key": normalize_endpoint_url(row["endpoint_url"])}
     insert_columns = _WRITE_COLUMNS
     placeholders = ", ".join(f"%({c})s" for c in insert_columns)
+    params = _prepare(row)
+    refreshed = {c: f"EXCLUDED.{c}" for c in _IMPORT_REFRESHABLE_COLUMNS}
+    if template_base is not None:
+        prefix = template_base.rstrip("/") + "/listings/"
+        params["template_url"] = f"{prefix}{row['id']}/template" if row.get("output_schema") is not None else None
+        params["template_prefix"] = prefix
+        refreshed["template_url"] = (
+            "CASE WHEN EXCLUDED.output_schema IS NULL THEN NULL "
+            "ELSE %(template_prefix)s || listings.id::text || '/template' END"
+        )
     refresh_clause = ", ".join(
-        f"{c} = CASE WHEN listings.claimed THEN listings.{c} ELSE EXCLUDED.{c} END"
-        for c in _IMPORT_REFRESHABLE_COLUMNS
+        f"{c} = CASE WHEN listings.claimed THEN listings.{c} ELSE {expr} END" for c, expr in refreshed.items()
     )
     with _connection() as conn:
         result = conn.execute(
@@ -857,7 +886,7 @@ def import_upsert(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
             f"ON CONFLICT (source, endpoint_key) WHERE source IS NOT NULL DO UPDATE SET "
             f"{refresh_clause}, last_synced_at = EXCLUDED.last_synced_at, missing_from_source_since = NULL "
             f"RETURNING {_READ}, (xmax = 0) AS _inserted",
-            _prepare(row),
+            params,
         ).fetchone()
     inserted = result.pop("_inserted")
     return result, inserted

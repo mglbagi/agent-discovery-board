@@ -64,8 +64,8 @@ agent-discovery-board/
    pip install -r requirements.txt
    ```
 
-2. Copy `.env.example` to `.env` and set `DATABASE_URL` and `SERVICE_BASE_URL`. **The
-   server will not start without these set** — no silent localhost/sqlite fallback,
+2. Copy `.env.example` to `.env` and set `DATABASE_URL`, `SERVICE_BASE_URL` and
+   `IMPORT_API_KEY`. **The server will not start without these set** — no silent localhost/sqlite fallback,
    on purpose (see `app/core/db.py` and `app/api/routes/discovery.py`).
 
    `DATABASE_URL` needs a real Postgres connection string. Render's free tier has an
@@ -425,6 +425,65 @@ python scripts/admin_update_listing.py --id <uuid> --expect submitted_by=0xOLD..
 It connects to whatever `DATABASE_URL` points at - with production settings that is the
 production database.
 
+## Automatic publishing: `POST /admin/import`
+
+The same sync as `scripts/bulk_import_listings.py`, callable over HTTP by whoever publishes a
+source directory (the sales team's export, for example). Both run `app/core/import_sync.py`, so
+they validate, upsert and flag the same way: per-record validation (a bad record is rejected and
+reported, never fatal), upsert by `(source, endpoint)`, **claimed listings are never modified**
+(only their sync timestamps), the do-not-import list is honored, and previously imported listings
+the batch no longer contains are marked **stale** (flagged, never deleted).
+
+```bash
+# 1. preview - counts only, nothing is written (this is the default)
+curl -X POST "$BOARD/admin/import" -H "Authorization: Bearer $IMPORT_API_KEY" \
+     -H "Content-Type: application/x-ndjson" --data-binary @listings-import.jsonl
+# 2. write
+curl -X POST "$BOARD/admin/import?dry_run=false" -H "Authorization: Bearer $IMPORT_API_KEY" \
+     -H "Content-Type: application/x-ndjson" --data-binary @listings-import.jsonl
+```
+
+The body is JSONL (one listing per line) or a JSON array. Query parameters, all read only after
+the key is accepted: `dry_run` (default `true`; pass `dry_run=false` to write), `source` (force one
+source for every record, like the script's `--source`), `mark_missing` (default `true`; `false`
+skips the stale marking, for a partial batch). The response:
+
+```json
+{"dry_run": true, "applied": false, "sources": ["x402_bazaar"], "records": 3243, "valid": 3243,
+ "added": 342, "updated": 2893, "stale": 152, "rejected": 0, "skipped_do_not_import": 0,
+ "claimed_content_preserved": 0, "duplicates_in_batch": 8, "mark_missing": true,
+ "rejected_details": [], "rejected_details_omitted": 0}
+```
+
+A dry run reports exactly what applying would do. `rejected_details` lists the first 50 rejected
+records (`index`, `name`, `reason`).
+
+- **Authorization**: only the `IMPORT_API_KEY` environment variable, sent as
+  `Authorization: Bearer <key>`. **The server will not start without it** (surrounding whitespace is
+  stripped; an empty value counts as missing). It is compared in constant time, a missing or wrong
+  key gets the same `401 unauthorized` before anything else about the request is looked at, and the
+  key is never logged or echoed. Wrong-key attempts have their own tighter rate limit, so the key
+  cannot be guessed; the real key is not locked out by them.
+- **Limits**: one batch per request, at most `IMPORT_MAX_BODY_BYTES` (default 16 MiB; the whole
+  x402 bazaar file is about 8.5 MB) or `413 body_too_large`; 6 requests per minute per client
+  (`IMPORT_RATE_LIMIT_MAX_REQUESTS` / `_WINDOW_SECONDS`) with a global daily cap of 200
+  (`IMPORT_GLOBAL_DAILY_CAP`), or `429 rate_limited`; one import at a time (`409 conflict`).
+- **Safety**: a batch with no valid records never marks anything stale, whatever `source` says - an
+  empty or fully rejected upload is a broken upload, not a statement that the source has no
+  listings (the script, run by a person, still treats an explicit empty `--source` as a sync).
+  Stale marking happens only after every record has been written.
+- **Audit**: every call writes exactly one log line, `[import-audit] {json}`, with the outcome
+  (`dry_run`, `applied`, `unauthorized`, `rate_limited`, `too_large`, `bad_batch`, `busy`, `error`),
+  status, client address, size and the counts (`records`, `valid`, `added`, `updated`, `stale`,
+  `rejected`, ...) and duration. Never the key, never record content. The endpoint is not listed
+  in `/openapi.json`, the agent-card or `llms.txt`.
+- **Template links**: an imported listing's `template_url` is always the board's own
+  `GET {SERVICE_BASE_URL}/listings/{id}/template` (and `null` when it has no `output_schema`, since
+  that route would 404), whatever link the source record carried - so templates do not depend on
+  files hosted elsewhere. A re-sync keeps the link on the listing's existing id. The script does the
+  same, and refuses `--apply` when `SERVICE_BASE_URL` is unset rather than write the source's links
+  back over the board's own.
+
 ## Discovery manifest
 
 `GET /.well-known/agent-card.json` (and `/.well-known/agent-card`, an alias without
@@ -543,7 +602,8 @@ business sharing a table.
    `render.yaml` as a Blueprint). Build command: `pip install -r requirements.txt`.
    Start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`.
 3. Set the environment variables from `.env.example` in Render's dashboard —
-   `DATABASE_URL` and `SERVICE_BASE_URL` (your Render URL) at minimum.
+   `DATABASE_URL`, `SERVICE_BASE_URL` (your Render URL) and `IMPORT_API_KEY` (a long random
+   secret; authorizes `POST /admin/import`) at minimum. The service will not start without them.
 4. Verify: `curl https://<your-service>.onrender.com/health`.
 5. Optional: fund a dedicated wallet and set `BOARD_PAYER_PRIVATE_KEY` to turn on
    trust-score badges (see [Trust score badges](#trust-score-badges)).

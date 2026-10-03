@@ -4,6 +4,7 @@ and marks missing listings stale."""
 
 import importlib.util
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,8 +75,8 @@ def test_default_is_a_dry_run_that_writes_nothing(run) -> None:
     assert code == 0, err
     assert "DRY RUN" in out and "1 record(s) would be inserted or updated" in out
     assert _log_lines(run) == []
-    page = client.get("/listings", params={"q": record["name"]})
-    assert page.json()["total"] == 0
+    # checked by identity, not by a fuzzy name search that another test's similar name could match
+    assert db.existing_import_listings(source, [record["endpoint_url"]]) == {}
 
 
 def test_apply_inserts_new_unclaimed_listings_and_logs(run) -> None:
@@ -287,14 +288,16 @@ def test_verification_and_template_url_are_imported_and_published(run) -> None:
         "/listings", params={"listing_type": "verification_profile", "q": record["name"]}
     ).json()["listings"][0]
     assert listing["verification"]["enforce_rules"] is True
-    assert listing["template_url"] == "https://example.com/templates/vt_x.json"
+    # The source's own link (GitHub, in practice) is replaced by the board's own template route.
+    board_link = f"{os.environ['SERVICE_BASE_URL']}/listings/{listing['id']}/template"
+    assert listing["template_url"] == board_link
     verify_action = next(a for a in listing["next_actions"] if a["action"] == "verify_output")
     assert verify_action["body"]["enforce_rules"] is True
     assert verify_action["body"]["rules"] == record["verification"]["rules"]
 
     template = client.get(f"/listings/{listing['id']}/template").json()
     assert template["verification"]["bounds"] == record["verification"]["bounds"]
-    assert template["template_url"] == "https://example.com/templates/vt_x.json"
+    assert template["template_url"] == board_link
 
 
 def test_solana_only_payment_wallet_is_derived_and_imported_unclaimed(run) -> None:
